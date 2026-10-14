@@ -73,3 +73,12 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+node_modules/
+server/node_modules/
+server/.env
+.env
+.env.*
+!.env.example
+android/.gradle/
+android/app/build/
+ios/Pods/
