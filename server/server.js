@@ -128,18 +128,17 @@ app.get('/messages', async (req, res) => {
       .sort({ createdAt: 1 })
       .lean();
 
-    return res.json(messages);
+    res.json(messages);
   } catch (error) {
-    console.error('GET /messages error:', error);
+    console.error('Get messages error:', error);
 
-    return res.status(500).json({
+    res.status(500).json({
       message: 'Failed to fetch messages',
     });
   }
 });
-
 // =========================
-// UNREAD COUNTS
+// UNREAD MESSAGE COUNTS
 // =========================
 
 app.get('/unread-counts', async (req, res) => {
@@ -152,12 +151,13 @@ app.get('/unread-counts', async (req, res) => {
       });
     }
 
-    const results = await Message.aggregate([
+    const unreadMessages = await Message.aggregate([
       {
         $match: {
           receiver: userId,
           status: { $ne: 'seen' },
           isDeleted: { $ne: true },
+          deletedFor: { $ne: userId },
         },
       },
       {
@@ -168,20 +168,18 @@ app.get('/unread-counts', async (req, res) => {
       },
     ]);
 
-    const unreadCounts = {};
+    const counts = {};
 
-    results.forEach(item => {
-      if (item._id != null) {
-        unreadCounts[String(item._id)] = item.count;
-      }
+    unreadMessages.forEach((item) => {
+      counts[item._id] = item.count;
     });
 
-    return res.json(unreadCounts);
+    res.json(counts);
   } catch (error) {
-    console.error('Unread counts fetch failed:', error);
+    console.error('Unread counts error:', error);
 
-    return res.status(500).json({
-      message: 'Failed to fetch unread counts',
+    res.status(500).json({
+      message: 'Failed to get unread counts',
     });
   }
 });
@@ -192,52 +190,36 @@ app.get('/unread-counts', async (req, res) => {
 
 app.get('/users', async (req, res) => {
   try {
-    const excludeId = req.query.exclude;
-    const filter = {};
-
-    if (
-      typeof excludeId === 'string' &&
-      mongoose.Types.ObjectId.isValid(excludeId)
-    ) {
-      filter._id = {
-        $ne: new mongoose.Types.ObjectId(excludeId),
-      };
-    }
-
-    const users = await User.find(filter)
-      .select('_id name email about profilePhoto')
-      .sort({ name: 1 })
+    const users = await User.find({})
+      .select('-password')
       .lean();
 
-    return res.json(
-      users.map(user => ({
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        about: user.about || '',
-        profilePhoto: user.profilePhoto || '',
-      }))
-    );
+    res.json(users);
   } catch (error) {
-    console.error('Users fetch failed:', error);
+    console.error('Get users error:', error);
 
-    return res.status(500).json({
+    res.status(500).json({
       message: 'Failed to fetch users',
     });
   }
 });
 
 // =========================
-// PUBLIC PROFILE HELPER
+// PUBLIC USER PROFILE
 // =========================
 
-const getPublicProfile = user => ({
-  id: user._id.toString(),
-  name: user.name,
-  email: user.email,
-  about: user.about || '',
-  profilePhoto: user.profilePhoto || '',
-});
+function getPublicProfile(user) {
+  if (!user) return null;
+
+  const data =
+    typeof user.toObject === 'function'
+      ? user.toObject()
+      : { ...user };
+
+  delete data.password;
+
+  return data;
+}
 
 // =========================
 // GET PROFILE
@@ -245,17 +227,9 @@ const getPublicProfile = user => ({
 
 app.get('/profile/:userId', async (req, res) => {
   try {
-    const { userId } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({
-        message: 'Invalid user ID',
-      });
-    }
-
-    const user = await User.findById(userId)
-      .select('_id name email about profilePhoto')
-      .lean();
+    const user = await User.findById(
+      req.params.userId
+    ).select('-password');
 
     if (!user) {
       return res.status(404).json({
@@ -263,12 +237,12 @@ app.get('/profile/:userId', async (req, res) => {
       });
     }
 
-    return res.json(getPublicProfile(user));
+    res.json(getPublicProfile(user));
   } catch (error) {
-    console.error('GET PROFILE ERROR:', error);
+    console.error('Get profile error:', error);
 
-    return res.status(500).json({
-      message: 'Failed to load profile',
+    res.status(500).json({
+      message: 'Failed to fetch profile',
     });
   }
 });
@@ -279,61 +253,32 @@ app.get('/profile/:userId', async (req, res) => {
 
 app.put('/profile/:userId', async (req, res) => {
   try {
-    const { userId } = req.params;
-    const { name, about, profilePhoto } = req.body;
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({
-        message: 'Invalid user ID',
-      });
-    }
+    const allowedFields = [
+      'name',
+      'username',
+      'bio',
+      'about',
+      'profilePhoto',
+      'avatar',
+      'phone',
+    ];
 
     const updates = {};
 
-    if (name !== undefined) {
-      if (typeof name !== 'string' || !name.trim()) {
-        return res.status(400).json({
-          message: 'Name is required',
-        });
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) {
+        updates[field] = req.body[field];
       }
-
-      updates.name = name.trim();
-    }
-
-    if (about !== undefined) {
-      if (typeof about !== 'string' || about.length > 150) {
-        return res.status(400).json({
-          message: 'About must be 150 characters or fewer',
-        });
-      }
-
-      updates.about = about.trim();
-    }
-
-    if (profilePhoto !== undefined) {
-      if (
-        typeof profilePhoto !== 'string' ||
-        profilePhoto.length > 2048
-      ) {
-        return res.status(400).json({
-          message: 'Invalid profile photo URL',
-        });
-      }
-
-      updates.profilePhoto = profilePhoto.trim();
-    }
-
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({
-        message: 'No profile fields provided',
-      });
     }
 
     const user = await User.findByIdAndUpdate(
-      userId,
+      req.params.userId,
       { $set: updates },
-      { new: true, runValidators: true }
-    ).select('_id name email about profilePhoto');
+      {
+        new: true,
+        runValidators: true,
+      }
+    ).select('-password');
 
     if (!user) {
       return res.status(404).json({
@@ -341,21 +286,21 @@ app.put('/profile/:userId', async (req, res) => {
       });
     }
 
-    return res.json({
+    res.json({
       message: 'Profile updated successfully',
       user: getPublicProfile(user),
     });
   } catch (error) {
-    console.error('UPDATE PROFILE ERROR:', error);
+    console.error('Update profile error:', error);
 
-    return res.status(500).json({
+    res.status(500).json({
       message: 'Failed to update profile',
     });
   }
 });
 
 // =========================
-// UPLOAD PROFILE PHOTO
+// PROFILE PHOTO UPLOAD
 // =========================
 
 app.post(
@@ -363,17 +308,9 @@ app.post(
   upload.single('photo'),
   async (req, res) => {
     try {
-      const { userId } = req.params;
-
-      if (!mongoose.Types.ObjectId.isValid(userId)) {
-        return res.status(400).json({
-          message: 'Invalid user ID',
-        });
-      }
-
       if (!req.file) {
         return res.status(400).json({
-          message: 'Please select a profile photo',
+          message: 'Please select a photo',
         });
       }
 
@@ -387,7 +324,9 @@ app.post(
         });
       }
 
-      const user = await User.findById(userId);
+      const user = await User.findById(
+        req.params.userId
+      );
 
       if (!user) {
         return res.status(404).json({
@@ -395,44 +334,43 @@ app.post(
         });
       }
 
-      const result = await new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          {
-            folder: 'chatapp/profile-photos',
-            public_id: `user_${userId}`,
-            overwrite: true,
-            resource_type: 'image',
-            allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
-          },
-          (error, uploadResult) => {
-            if (error) {
-              return reject(error);
+      const uploadResult = await new Promise(
+        (resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            {
+              folder: 'chatapp/profile-photos',
+              resource_type: 'image',
+            },
+            (error, result) => {
+              if (error) return reject(error);
+              resolve(result);
             }
+          );
 
-            if (!uploadResult) {
-              return reject(
-                new Error('Cloudinary upload returned no result')
-              );
-            }
+          Readable.from(req.file.buffer).pipe(stream);
+        }
+      );
 
-            resolve(uploadResult);
-          }
-        );
+      const photoUrl = uploadResult.secure_url;
 
-        Readable.from(req.file.buffer).pipe(stream);
-      });
+      if (user.schema.path('profilePhoto')) {
+        user.profilePhoto = photoUrl;
+      } else if (user.schema.path('avatar')) {
+        user.avatar = photoUrl;
+      } else {
+        user.profilePhoto = photoUrl;
+      }
 
-      user.profilePhoto = result.secure_url;
       await user.save();
 
-      return res.json({
-        message: 'Profile photo updated successfully',
+      res.json({
+        message: 'Profile photo uploaded successfully',
         user: getPublicProfile(user),
       });
     } catch (error) {
-      console.error('PROFILE PHOTO UPLOAD ERROR:', error);
+      console.error('Profile photo upload error:', error);
 
-      return res.status(500).json({
+      res.status(500).json({
         message: 'Failed to upload profile photo',
       });
     }
@@ -440,143 +378,273 @@ app.post(
 );
 
 // =========================
-// REGISTER WITH BCRYPT
+// REGISTER
 // =========================
 
 app.post('/register', async (req, res) => {
   try {
-    const name =
-      typeof req.body.name === 'string'
-        ? req.body.name.trim()
-        : '';
+    const { name, username, email, password } = req.body;
 
-    const email =
-      typeof req.body.email === 'string'
-        ? req.body.email.trim().toLowerCase()
-        : '';
-
-    const password =
-      typeof req.body.password === 'string'
-        ? req.body.password
-        : '';
-
-    if (!name || !email || !password) {
+    if (!name || !password || !(username || email)) {
       return res.status(400).json({
-        message: 'All fields are required',
+        message: 'Name, username/email and password are required',
       });
     }
 
-    if (password.length < 8) {
-      return res.status(400).json({
-        message: 'Password must be at least 8 characters long',
-      });
-    }
+    const normalizedEmail = email
+      ? String(email).trim().toLowerCase()
+      : '';
 
-    const existingUser = await User.findOne({ email });
+    const normalizedUsername = username
+      ? String(username).trim()
+      : '';
+
+    const existingUser = await User.findOne({
+      $or: [
+        ...(normalizedEmail
+          ? [{ email: normalizedEmail }]
+          : []),
+        ...(normalizedUsername
+          ? [{ username: normalizedUsername }]
+          : []),
+      ],
+    });
 
     if (existingUser) {
-      return res.status(400).json({
+      return res.status(409).json({
         message: 'User already exists',
       });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 12);
+    const hashedPassword = await bcrypt.hash(
+      String(password),
+      10
+    );
 
     const user = await User.create({
-      name,
-      email,
+      name: String(name).trim(),
+      ...(normalizedUsername
+        ? { username: normalizedUsername }
+        : {}),
+      ...(normalizedEmail
+        ? { email: normalizedEmail }
+        : {}),
       password: hashedPassword,
     });
 
-    return res.status(201).json({
+    res.status(201).json({
       message: 'Registration successful',
-      userId: user._id.toString(),
-      name: user.name,
-      email: user.email,
+      user: getPublicProfile(user),
     });
   } catch (error) {
-    if (error && error.code === 11000) {
-      return res.status(400).json({
-        message: 'User already exists',
-      });
-    }
+    console.error('Register error:', error);
 
-    console.error('Registration failed:', error);
-
-    return res.status(500).json({
+    res.status(500).json({
       message: 'Registration failed',
     });
   }
 });
 
 // =========================
-// LOGIN WITH BCRYPT
-// Supports migration of legacy plain-text passwords
+// LOGIN
 // =========================
 
 app.post('/login', async (req, res) => {
   try {
-    const email =
-      typeof req.body.email === 'string'
-        ? req.body.email.trim().toLowerCase()
-        : '';
+    const { username, email, password } = req.body;
 
-    const password =
-      typeof req.body.password === 'string'
-        ? req.body.password
-        : '';
-
-    if (!email || !password) {
+    if ((!username && !email) || !password) {
       return res.status(400).json({
-        message: 'Email and password are required',
+        message: 'Username/email and password are required',
       });
     }
 
-    const user = await User.findOne({ email });
+    const loginValue = String(
+      username || email
+    ).trim();
 
-    if (!user || typeof user.password !== 'string') {
+    const user = await User.findOne({
+      $or: [
+        { username: loginValue },
+        { email: loginValue.toLowerCase() },
+      ],
+    });
+
+    if (!user) {
       return res.status(401).json({
-        message: 'Invalid email or password',
+        message: 'Invalid username/email or password',
       });
     }
 
-    const looksLikeBcryptHash =
-      /^\$2[aby]\$\d{2}\$/.test(user.password);
+    let passwordMatches = await bcrypt.compare(
+      String(password),
+      user.password
+    );
 
-    let passwordIsValid = false;
-
-    if (looksLikeBcryptHash) {
-      passwordIsValid = await bcrypt.compare(
-        password,
-        user.password
+    // Support migration from old plain-text passwords.
+    if (!passwordMatches && user.password === String(password)) {
+      user.password = await bcrypt.hash(
+        String(password),
+        10
       );
-    } else if (user.password === password) {
-      passwordIsValid = true;
-      user.password = await bcrypt.hash(password, 12);
+
       await user.save();
+      passwordMatches = true;
     }
 
-    if (!passwordIsValid) {
+    if (!passwordMatches) {
       return res.status(401).json({
-        message: 'Invalid email or password',
+        message: 'Invalid username/email or password',
       });
     }
 
-    return res.json({
+    res.json({
       message: 'Login successful',
-      userId: user._id.toString(),
-      name: user.name,
-      email: user.email,
+      user: getPublicProfile(user),
     });
   } catch (error) {
-    console.error('Login failed:', error);
+    console.error('Login error:', error);
 
-    return res.status(500).json({
+    res.status(500).json({
       message: 'Login failed',
     });
   }
 });
+// =========================
+// CHAT MEDIA UPLOAD
+// =========================
 
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 20 * 1024 * 1024, // Maximum 20 MB
+    files: 1,
+  },
+});
+
+const allowedChatMimeTypes = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+
+  'video/mp4',
+  'video/quicktime',
+
+  'application/pdf',
+  'text/plain',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/aac',
+  'audio/wav',
+  'audio/ogg',
+];
+
+app.post(
+  '/upload/chat-media/:userId',
+  (req, res, next) => {
+    chatUpload.single('file')(req, res, (error) => {
+      if (!error) {
+        return next();
+      }
+
+      return res.status(400).json({
+        message:
+          error.code === 'LIMIT_FILE_SIZE'
+            ? 'File must be 20 MB or smaller.'
+            : 'Invalid file upload.',
+      });
+    });
+  },
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+
+      if (!mongoose.Types.ObjectId.isValid(userId)) {
+        return res.status(400).json({
+          message: 'Invalid user ID',
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          message: 'Please select a file',
+        });
+      }
+
+      if (!allowedChatMimeTypes.includes(req.file.mimetype)) {
+        return res.status(415).json({
+          message: 'This file type is not supported',
+        });
+      }
+
+      if (
+        !process.env.CLOUDINARY_CLOUD_NAME ||
+        !process.env.CLOUDINARY_API_KEY ||
+        !process.env.CLOUDINARY_API_SECRET
+      ) {
+        return res.status(500).json({
+          message: 'Cloudinary is not configured',
+        });
+      }
+
+      const mimeType = req.file.mimetype;
+
+      const resourceType = mimeType.startsWith('image/')
+        ? 'image'
+        : mimeType.startsWith('video/') ||
+            mimeType.startsWith('audio/')
+          ? 'video'
+          : 'raw';
+
+      const result = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: 'chatapp/chat-media',
+            resource_type: resourceType,
+            use_filename: true,
+            unique_filename: true,
+          },
+          (error, uploadedFile) => {
+            if (error) {
+              return reject(error);
+            }
+
+            if (!uploadedFile) {
+              return reject(
+                new Error('Cloudinary returned no upload result')
+              );
+            }
+
+            resolve(uploadedFile);
+          }
+        );
+
+        Readable.from(req.file.buffer).pipe(stream);
+      });
+
+      return res.json({
+        mediaUrl: result.secure_url,
+        fileName: req.file.originalname,
+        mimeType,
+        fileSize: req.file.size,
+      });
+    } catch (error) {
+      console.error('CHAT MEDIA UPLOAD ERROR:', error);
+
+      return res.status(500).json({
+        message: 'Failed to upload chat attachment',
+      });
+    }
+  }
+);
 // =========================
 // ONLINE USERS
 // =========================
@@ -589,9 +657,7 @@ const onlineUsers = new Map();
 
 async function updateUnreadCount(receiverId, senderId) {
   try {
-    if (!receiverId || !senderId) {
-      return;
-    }
+    if (!receiverId || !senderId) return;
 
     const receiver = String(receiverId);
     const sender = String(senderId);
@@ -601,6 +667,7 @@ async function updateUnreadCount(receiverId, senderId) {
       sender,
       status: { $ne: 'seen' },
       isDeleted: { $ne: true },
+      deletedFor: { $ne: receiver },
     });
 
     const receiverSocketId = onlineUsers.get(receiver);
@@ -620,20 +687,15 @@ async function updateUnreadCount(receiverId, senderId) {
 // SOCKET CONNECTION
 // =========================
 
-io.on('connection', socket => {
+io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // USER ONLINE
-  socket.on('user_online', userId => {
-    if (!userId) {
-      return;
-    }
+  socket.on('user_online', (userId) => {
+    if (!userId) return;
 
     const id = String(userId);
-
     onlineUsers.set(id, socket.id);
 
-    console.log('USER ONLINE:', id);
     io.emit('online_users', Array.from(onlineUsers.keys()));
 
     socket.broadcast.emit('user_status', {
@@ -642,53 +704,92 @@ io.on('connection', socket => {
     });
   });
 
-  // JOIN CHAT ROOM
-  socket.on('join_room', roomId => {
-    if (!roomId) {
-      return;
-    }
+  socket.on('join_room', (roomId) => {
+    if (!roomId) return;
 
     socket.join(String(roomId));
     console.log('JOINED ROOM:', String(roomId));
   });
 
-  // TYPING INDICATOR
-  socket.on('typing', data => {
-    if (!data?.roomId || !data?.userId) {
-      return;
-    }
+  socket.on('typing', (data) => {
+    if (!data?.roomId || !data?.userId) return;
 
-    const roomId = String(data.roomId);
-
-    socket.to(roomId).emit('user_typing', {
-      roomId,
+    socket.to(String(data.roomId)).emit('user_typing', {
+      roomId: String(data.roomId),
       userId: String(data.userId),
       isTyping: Boolean(data.isTyping),
     });
   });
 
-  // SEND MESSAGE
-  socket.on('send_message', async message => {
-    try {
-      console.log('MESSAGE RECEIVED:', message);
+  // =========================
+  // SEND TEXT / MEDIA / LOCATION / CONTACT
+  // =========================
 
-      if (
-        !message?.text?.trim() ||
-        !message?.sender ||
-        !message?.receiver ||
-        !message?.roomId
-      ) {
-        console.log('INVALID MESSAGE DATA');
+  socket.on('send_message', async (message) => {
+    try {
+      const senderId = String(message?.sender || '').trim();
+      const receiverId = String(message?.receiver || '').trim();
+      const roomId = String(message?.roomId || '').trim();
+      const text =
+        typeof message?.text === 'string'
+          ? message.text.trim()
+          : '';
+
+      const allowedTypes = [
+        'text',
+        'image',
+        'video',
+        'document',
+        'audio',
+        'location',
+        'contact',
+      ];
+
+      const type = allowedTypes.includes(message?.type)
+        ? message.type
+        : 'text';
+
+      const hasMedia =
+        ['image', 'video', 'document', 'audio'].includes(type) &&
+        typeof message?.mediaUrl === 'string' &&
+        message.mediaUrl.trim().length > 0;
+
+      const latitude = Number(message?.location?.latitude);
+      const longitude = Number(message?.location?.longitude);
+
+      const hasLocation =
+        type === 'location' &&
+        Number.isFinite(latitude) &&
+        Number.isFinite(longitude);
+
+      const contactName = String(
+        message?.contact?.name || ''
+      ).trim();
+
+      const hasContact =
+        type === 'contact' && contactName.length > 0;
+
+      if (!senderId || !receiverId || !roomId) {
+        console.log('Message missing sender, receiver, or roomId');
         return;
       }
 
-      const senderId = String(message.sender);
-      const receiverId = String(message.receiver);
-      const roomId = String(message.roomId);
+      if (type === 'text' && !text) return;
+      if (
+        ['image', 'video', 'document', 'audio'].includes(type) &&
+        !hasMedia
+      ) return;
+      if (type === 'location' && !hasLocation) return;
+      if (type === 'contact' && !hasContact) return;
 
       let replyTo = null;
 
-      if (message.replyTo?.messageId) {
+      if (
+        message.replyTo?.messageId &&
+        mongoose.Types.ObjectId.isValid(
+          String(message.replyTo.messageId)
+        )
+      ) {
         const originalMessage = await Message.findOne({
           _id: message.replyTo.messageId,
           roomId,
@@ -699,19 +800,41 @@ io.on('connection', socket => {
             messageId: originalMessage._id.toString(),
             text: originalMessage.isDeleted
               ? 'This message was deleted'
-              : originalMessage.text,
+              : originalMessage.text ||
+                originalMessage.fileName ||
+                'Attachment',
             sender: String(originalMessage.sender),
           };
         }
       }
 
       const savedMessage = await Message.create({
-        text: message.text.trim(),
+        text,
         sender: senderId,
         receiver: receiverId,
         roomId,
         status: 'sent',
         replyTo,
+        type,
+        mediaUrl: hasMedia ? message.mediaUrl.trim() : '',
+        fileName: String(message?.fileName || ''),
+        mimeType: String(message?.mimeType || ''),
+        fileSize: Number.isFinite(Number(message?.fileSize))
+          ? Number(message.fileSize)
+          : 0,
+        location: hasLocation
+          ? {
+              latitude,
+              longitude,
+              address: String(message?.location?.address || ''),
+            }
+          : undefined,
+        contact: hasContact
+          ? {
+              name: contactName,
+              phone: String(message?.contact?.phone || ''),
+            }
+          : undefined,
         isDeleted: false,
       });
 
@@ -724,12 +847,22 @@ io.on('connection', socket => {
         roomId,
         status: savedMessage.status,
         replyTo: savedMessage.replyTo || null,
+        type: savedMessage.type || 'text',
+        mediaUrl: savedMessage.mediaUrl || '',
+        fileName: savedMessage.fileName || '',
+        mimeType: savedMessage.mimeType || '',
+        fileSize: savedMessage.fileSize || 0,
+        location: savedMessage.location || null,
+        contact: savedMessage.contact || null,
         isDeleted: false,
+        createdAt: savedMessage.createdAt,
       };
 
-      console.log('MESSAGE SAVED:', messageData.id);
+      socket.emit('message_sent', {
+        ...messageData,
+        clientTempId: message?.clientTempId || null,
+      });
 
-      socket.emit('message_sent', messageData);
       socket.to(roomId).emit('receive_message', messageData);
 
       await updateUnreadCount(receiverId, senderId);
@@ -737,9 +870,11 @@ io.on('connection', socket => {
       console.error('Message save failed:', error);
     }
   });
-
+    // =========================
   // DELETE MESSAGE FOR EVERYONE
-  socket.on('delete_message', async data => {
+  // =========================
+
+  socket.on('delete_message', async (data) => {
     try {
       const messageId = String(data?.messageId || '').trim();
       const userId = String(data?.userId || '').trim();
@@ -784,17 +919,12 @@ io.on('connection', socket => {
 
       await message.save();
 
-      const payload = {
+      io.to(String(message.roomId)).emit('message_deleted', {
         messageId: message._id.toString(),
         roomId: String(message.roomId),
         text: 'This message was deleted',
         isDeleted: true,
-      };
-
-      io.to(String(message.roomId)).emit(
-        'message_deleted',
-        payload
-      );
+      });
 
       await updateUnreadCount(
         String(message.receiver),
@@ -809,8 +939,11 @@ io.on('connection', socket => {
     }
   });
 
+  // =========================
   // DELETE MESSAGE FOR ME
-  socket.on('delete_message_for_me', async data => {
+  // =========================
+
+  socket.on('delete_message_for_me', async (data) => {
     try {
       const messageId = String(data?.messageId || '').trim();
       const userId = String(data?.userId || '').trim();
@@ -830,7 +963,10 @@ io.on('connection', socket => {
       const message = await Message.findOne({
         _id: messageId,
         roomId,
-        $or: [{ sender: userId }, { receiver: userId }],
+        $or: [
+          { sender: userId },
+          { receiver: userId },
+        ],
       });
 
       if (!message) {
@@ -859,8 +995,11 @@ io.on('connection', socket => {
     }
   });
 
+  // =========================
   // MESSAGE DELIVERED
-  socket.on('message_delivered', async messageId => {
+  // =========================
+
+  socket.on('message_delivered', async (messageId) => {
     try {
       if (
         !messageId ||
@@ -895,8 +1034,11 @@ io.on('connection', socket => {
     }
   });
 
+  // =========================
   // MESSAGE SEEN
-  socket.on('message_seen', async messageId => {
+  // =========================
+
+  socket.on('message_seen', async (messageId) => {
     try {
       if (
         !messageId ||
@@ -916,7 +1058,6 @@ io.on('connection', socket => {
 
       const senderId = String(updatedMessage.sender);
       const receiverId = String(updatedMessage.receiver);
-
       const senderSocketId = onlineUsers.get(senderId);
 
       if (senderSocketId) {
@@ -932,7 +1073,10 @@ io.on('connection', socket => {
     }
   });
 
+  // =========================
   // DISCONNECT
+  // =========================
+
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
 
@@ -945,7 +1089,11 @@ io.on('connection', socket => {
           online: false,
         });
 
-        io.emit('online_users', Array.from(onlineUsers.keys()));
+        io.emit(
+          'online_users',
+          Array.from(onlineUsers.keys())
+        );
+
         break;
       }
     }
@@ -953,7 +1101,7 @@ io.on('connection', socket => {
 });
 
 // =========================
-// CONNECT MONGODB + START SERVER
+// CONNECT MONGODB + START
 // =========================
 
 const PORT = process.env.PORT || 5000;
@@ -973,7 +1121,7 @@ mongoose
       console.log(`Health check: http://localhost:${PORT}/health`);
     });
   })
-  .catch(error => {
+  .catch((error) => {
     console.error('MongoDB connection failed:', error);
     process.exit(1);
   });
