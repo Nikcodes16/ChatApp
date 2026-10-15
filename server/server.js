@@ -1,5 +1,4 @@
 const dns = require('dns');
-
 dns.setServers(['8.8.8.8', '1.1.1.1']);
 
 require('dotenv').config();
@@ -10,6 +9,9 @@ const mongoose = require('mongoose');
 const http = require('http');
 const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const { v2: cloudinary } = require('cloudinary');
+const { Readable } = require('stream');
 
 const Message = require('./models/Message');
 const User = require('./models/User');
@@ -25,6 +27,64 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(express.json());
+
+// =========================
+// CLOUDINARY CONFIGURATION
+// =========================
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// Profile-photo upload: maximum 5 MB
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024,
+    files: 1,
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+    ];
+
+    if (!allowedTypes.includes(file.mimetype)) {
+      return cb(
+        new Error('Only JPG, PNG, and WebP images are allowed.')
+      );
+    }
+
+    cb(null, true);
+  },
+});
+
+// Handle upload validation errors
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({
+      message:
+        err.code === 'LIMIT_FILE_SIZE'
+          ? 'Image must be 5 MB or smaller.'
+          : 'Invalid upload.',
+    });
+  }
+
+  if (
+    err &&
+    err.message ===
+      'Only JPG, PNG, and WebP images are allowed.'
+  ) {
+    return res.status(400).json({
+      message: err.message,
+    });
+  }
+
+  next(err);
+});
 
 // =========================
 // HEALTH CHECK
@@ -71,6 +131,7 @@ app.get('/messages', async (req, res) => {
     return res.json(messages);
   } catch (error) {
     console.error('GET /messages error:', error);
+
     return res.status(500).json({
       message: 'Failed to fetch messages',
     });
@@ -155,7 +216,7 @@ app.get('/users', async (req, res) => {
         email: user.email,
         about: user.about || '',
         profilePhoto: user.profilePhoto || '',
-      })),
+      }))
     );
   } catch (error) {
     console.error('Users fetch failed:', error);
@@ -205,6 +266,7 @@ app.get('/profile/:userId', async (req, res) => {
     return res.json(getPublicProfile(user));
   } catch (error) {
     console.error('GET PROFILE ERROR:', error);
+
     return res.status(500).json({
       message: 'Failed to load profile',
     });
@@ -270,7 +332,7 @@ app.put('/profile/:userId', async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { $set: updates },
-      { new: true, runValidators: true },
+      { new: true, runValidators: true }
     ).select('_id name email about profilePhoto');
 
     if (!user) {
@@ -285,11 +347,97 @@ app.put('/profile/:userId', async (req, res) => {
     });
   } catch (error) {
     console.error('UPDATE PROFILE ERROR:', error);
+
     return res.status(500).json({
       message: 'Failed to update profile',
     });
   }
 });
+
+// =========================
+// UPLOAD PROFILE PHOTO
+// =========================
+
+app.post(
+  '/upload/profile-photo/:userId',
+  upload.single('photo'),
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+
+      if (!mongoose.Types.ObjectId.isValid(userId)) {
+        return res.status(400).json({
+          message: 'Invalid user ID',
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          message: 'Please select a profile photo',
+        });
+      }
+
+      if (
+        !process.env.CLOUDINARY_CLOUD_NAME ||
+        !process.env.CLOUDINARY_API_KEY ||
+        !process.env.CLOUDINARY_API_SECRET
+      ) {
+        return res.status(500).json({
+          message: 'Cloudinary is not configured',
+        });
+      }
+
+      const user = await User.findById(userId);
+
+      if (!user) {
+        return res.status(404).json({
+          message: 'User not found',
+        });
+      }
+
+      const result = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: 'chatapp/profile-photos',
+            public_id: `user_${userId}`,
+            overwrite: true,
+            resource_type: 'image',
+            allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
+          },
+          (error, uploadResult) => {
+            if (error) {
+              return reject(error);
+            }
+
+            if (!uploadResult) {
+              return reject(
+                new Error('Cloudinary upload returned no result')
+              );
+            }
+
+            resolve(uploadResult);
+          }
+        );
+
+        Readable.from(req.file.buffer).pipe(stream);
+      });
+
+      user.profilePhoto = result.secure_url;
+      await user.save();
+
+      return res.json({
+        message: 'Profile photo updated successfully',
+        user: getPublicProfile(user),
+      });
+    } catch (error) {
+      console.error('PROFILE PHOTO UPLOAD ERROR:', error);
+
+      return res.status(500).json({
+        message: 'Failed to upload profile photo',
+      });
+    }
+  }
+);
 
 // =========================
 // REGISTER WITH BCRYPT
@@ -332,7 +480,6 @@ app.post('/register', async (req, res) => {
       });
     }
 
-    // Store a hash, never the plain-text password.
     const hashedPassword = await bcrypt.hash(password, 12);
 
     const user = await User.create({
@@ -364,8 +511,7 @@ app.post('/register', async (req, res) => {
 
 // =========================
 // LOGIN WITH BCRYPT
-// Supports old plain-text accounts once
-// and upgrades them after successful login.
+// Supports migration of legacy plain-text passwords
 // =========================
 
 app.post('/login', async (req, res) => {
@@ -402,10 +548,9 @@ app.post('/login', async (req, res) => {
     if (looksLikeBcryptHash) {
       passwordIsValid = await bcrypt.compare(
         password,
-        user.password,
+        user.password
       );
     } else if (user.password === password) {
-      // Migrate an old plain-text password after a valid login.
       passwordIsValid = true;
       user.password = await bcrypt.hash(password, 12);
       await user.save();
@@ -431,6 +576,7 @@ app.post('/login', async (req, res) => {
     });
   }
 });
+
 // =========================
 // ONLINE USERS
 // =========================
@@ -477,10 +623,7 @@ async function updateUnreadCount(receiverId, senderId) {
 io.on('connection', socket => {
   console.log('User connected:', socket.id);
 
-  // =========================
   // USER ONLINE
-  // =========================
-
   socket.on('user_online', userId => {
     if (!userId) {
       return;
@@ -491,8 +634,6 @@ io.on('connection', socket => {
     onlineUsers.set(id, socket.id);
 
     console.log('USER ONLINE:', id);
-    console.log('ONLINE USERS:', Array.from(onlineUsers.keys()));
-
     io.emit('online_users', Array.from(onlineUsers.keys()));
 
     socket.broadcast.emit('user_status', {
@@ -501,24 +642,17 @@ io.on('connection', socket => {
     });
   });
 
-  // =========================
   // JOIN CHAT ROOM
-  // =========================
-
   socket.on('join_room', roomId => {
     if (!roomId) {
       return;
     }
 
     socket.join(String(roomId));
-
     console.log('JOINED ROOM:', String(roomId));
   });
 
-  // =========================
   // TYPING INDICATOR
-  // =========================
-
   socket.on('typing', data => {
     if (!data?.roomId || !data?.userId) {
       return;
@@ -533,10 +667,7 @@ io.on('connection', socket => {
     });
   });
 
-  // =========================
   // SEND MESSAGE
-  // =========================
-
   socket.on('send_message', async message => {
     try {
       console.log('MESSAGE RECEIVED:', message);
@@ -557,7 +688,6 @@ io.on('connection', socket => {
 
       let replyTo = null;
 
-      // Validate the reply target against the same chat room.
       if (message.replyTo?.messageId) {
         const originalMessage = await Message.findOne({
           _id: message.replyTo.messageId,
@@ -598,12 +728,8 @@ io.on('connection', socket => {
       };
 
       console.log('MESSAGE SAVED:', messageData.id);
-      console.log('SAVED REPLY:', messageData.replyTo);
 
-      // Acknowledge the sender.
       socket.emit('message_sent', messageData);
-
-      // Deliver the message to the other person in the room.
       socket.to(roomId).emit('receive_message', messageData);
 
       await updateUnreadCount(receiverId, senderId);
@@ -612,22 +738,12 @@ io.on('connection', socket => {
     }
   });
 
-  // =========================
   // DELETE MESSAGE FOR EVERYONE
-  // =========================
-
   socket.on('delete_message', async data => {
     try {
       const messageId = String(data?.messageId || '').trim();
       const userId = String(data?.userId || '').trim();
       const requestedRoomId = String(data?.roomId || '').trim();
-
-      console.log('DELETE REQUEST RECEIVED:', {
-        messageId,
-        userId,
-        roomId: requestedRoomId,
-        socketId: socket.id,
-      });
 
       if (
         !mongoose.Types.ObjectId.isValid(messageId) ||
@@ -639,7 +755,6 @@ io.on('connection', socket => {
         return;
       }
 
-      // Only the original sender may delete this message.
       const message = await Message.findOne({
         _id: messageId,
         sender: userId,
@@ -647,10 +762,6 @@ io.on('connection', socket => {
       });
 
       if (!message) {
-        console.log(
-          'DELETE FAILED: message not found, already deleted, or sender mismatch',
-        );
-
         socket.emit('delete_message_error', {
           message: 'Message not found or you cannot delete it',
         });
@@ -661,15 +772,12 @@ io.on('connection', socket => {
         requestedRoomId &&
         String(message.roomId) !== requestedRoomId
       ) {
-        console.log('DELETE FAILED: room mismatch');
-
         socket.emit('delete_message_error', {
           message: 'Message does not belong to this chat',
         });
         return;
       }
 
-      // Soft delete: keep the record so chat history stays consistent.
       message.text = 'This message was deleted';
       message.isDeleted = true;
       message.deletedBy = userId;
@@ -683,14 +791,14 @@ io.on('connection', socket => {
         isDeleted: true,
       };
 
-      console.log('DELETE SUCCESS:', payload);
-
-      // Send the update to both users in the chat room.
-      io.to(String(message.roomId)).emit('message_deleted', payload);
+      io.to(String(message.roomId)).emit(
+        'message_deleted',
+        payload
+      );
 
       await updateUnreadCount(
         String(message.receiver),
-        String(message.sender),
+        String(message.sender)
       );
     } catch (error) {
       console.error('DELETE MESSAGE ERROR:', error);
@@ -701,10 +809,7 @@ io.on('connection', socket => {
     }
   });
 
-  // =========================
   // DELETE MESSAGE FOR ME
-  // =========================
-
   socket.on('delete_message_for_me', async data => {
     try {
       const messageId = String(data?.messageId || '').trim();
@@ -735,13 +840,11 @@ io.on('connection', socket => {
         return;
       }
 
-      // Avoid adding the same user more than once.
       if (!message.deletedFor.includes(userId)) {
         message.deletedFor.push(userId);
         await message.save();
       }
 
-      // Notify only the requesting socket.
       socket.emit('message_deleted_for_me', {
         messageId: message._id.toString(),
         roomId: String(message.roomId),
@@ -756,10 +859,7 @@ io.on('connection', socket => {
     }
   });
 
-  // =========================
   // MESSAGE DELIVERED
-  // =========================
-
   socket.on('message_delivered', async messageId => {
     try {
       if (
@@ -781,7 +881,7 @@ io.on('connection', socket => {
       }
 
       const senderSocketId = onlineUsers.get(
-        String(updatedMessage.sender),
+        String(updatedMessage.sender)
       );
 
       if (senderSocketId) {
@@ -795,10 +895,7 @@ io.on('connection', socket => {
     }
   });
 
-  // =========================
   // MESSAGE SEEN
-  // =========================
-
   socket.on('message_seen', async messageId => {
     try {
       if (
@@ -835,10 +932,7 @@ io.on('connection', socket => {
     }
   });
 
-  // =========================
   // DISCONNECT
-  // =========================
-
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
 
@@ -852,12 +946,12 @@ io.on('connection', socket => {
         });
 
         io.emit('online_users', Array.from(onlineUsers.keys()));
-
         break;
       }
     }
   });
 });
+
 // =========================
 // CONNECT MONGODB + START SERVER
 // =========================
