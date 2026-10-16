@@ -4,6 +4,7 @@ dns.setServers(['8.8.8.8', '1.1.1.1']);
 require('dotenv').config();
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
@@ -553,10 +554,17 @@ app.post('/login', async (req, res) => {
       });
     }
 
-    res.json({
-      message: 'Login successful',
-      user: getPublicProfile(user),
-    });
+    const token = jwt.sign(
+  { userId: user._id.toString() },
+  process.env.JWT_SECRET,
+  { expiresIn: '7d' },
+);
+
+res.json({
+  message: 'Login successful',
+  token,
+  user: getPublicProfile(user),
+});
   } catch (error) {
     console.error('Login error:', error);
 
