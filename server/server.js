@@ -2,7 +2,8 @@ const dns = require('dns');
 dns.setServers(['8.8.8.8', '1.1.1.1']);
 
 require('dotenv').config();
-
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
@@ -27,6 +28,13 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(express.json());
+
+//razorpay
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
 // =========================
 // CLOUDINARY CONFIGURATION
@@ -107,6 +115,46 @@ app.get('/health', (req, res) => {
 });
 
 // =========================
+// RAZORPAY: CREATE TEST ORDER
+// =========================
+
+app.post('/payments/create-order', async (req, res) => {
+  try {
+    if (
+      !process.env.RAZORPAY_KEY_ID ||
+      !process.env.RAZORPAY_KEY_SECRET
+    ) {
+      return res.status(500).json({
+        message: 'Razorpay keys are not configured',
+      });
+    }
+
+    const order = await razorpay.orders.create({
+      amount: 1000, // ₹10.00, amount is in paise
+      currency: 'INR',
+      receipt: `chatapp_${Date.now()}`,
+    });
+
+    return res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (error) {
+    console.error('Create Razorpay order error:', error);
+
+    return res.status(500).json({
+      message: 'Unable to create payment order',
+    });
+  }
+});
+
+// =========================
+// GET CHAT HISTORY
+// =========================
+
+// =========================
 // GET CHAT HISTORY
 // =========================
 
@@ -121,6 +169,7 @@ app.get('/messages', async (req, res) => {
       });
     }
 
+    // First, find messages using the exact roomId.
     const messages = await Message.find({
       roomId,
       deletedFor: { $ne: userId },
@@ -128,11 +177,17 @@ app.get('/messages', async (req, res) => {
       .sort({ createdAt: 1 })
       .lean();
 
-    res.json(messages);
-  } catch (error) {
-    console.error('Get messages error:', error);
+    console.log('[GET /messages]', {
+      roomId,
+      userId,
+      count: messages.length,
+    });
 
-    res.status(500).json({
+    return res.json(messages);
+  } catch (error) {
+    console.error('GET /messages error:', error);
+
+    return res.status(500).json({
       message: 'Failed to fetch messages',
     });
   }
