@@ -2,7 +2,9 @@ const dns = require('dns');
 dns.setServers(['8.8.8.8', '1.1.1.1']);
 
 require('dotenv').config();
+
 const Razorpay = require('razorpay');
+
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const express = require('express');
@@ -20,7 +22,7 @@ const User = require('./models/User');
 
 const app = express();
 const server = http.createServer(app);
-
+const Payment = require('./models/Payment');
 const io = new Server(server, {
   cors: {
     origin: '*',
@@ -29,6 +31,32 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(express.json());
+
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      message: 'Authentication token required',
+    });
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
+
+    req.userId = decoded.userId;
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      message: 'Invalid or expired token',
+    });
+  }
+}
 
 //razorpay
 
@@ -119,41 +147,178 @@ app.get('/health', (req, res) => {
 // RAZORPAY: CREATE TEST ORDER
 // =========================
 
-app.post('/payments/create-order', async (req, res) => {
-  try {
-    if (
-      !process.env.RAZORPAY_KEY_ID ||
-      !process.env.RAZORPAY_KEY_SECRET
-    ) {
+app.post(
+  '/payments/create-order',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      if (
+        !process.env.RAZORPAY_KEY_ID ||
+        !process.env.RAZORPAY_KEY_SECRET
+      ) {
+        return res.status(500).json({
+          message: 'Razorpay keys are not configured',
+        });
+      }
+
+      const user = await User.findById(req.userId);
+
+      if (!user) {
+        return res.status(404).json({
+          message: 'User not found',
+        });
+      }
+
+      const amount = 1000; // ₹10 in paise
+
+      const order = await razorpay.orders.create({
+        amount,
+        currency: 'INR',
+        receipt: `chatapp_${Date.now()}`,
+      });
+
+      await Payment.create({
+        userId: user._id,
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        status: 'created',
+      });
+
+      return res.json({
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        keyId: process.env.RAZORPAY_KEY_ID,
+      });
+    } catch (error) {
+      console.error('Create Razorpay order error:', error);
+
       return res.status(500).json({
-        message: 'Razorpay keys are not configured',
+        message: 'Unable to create payment order',
       });
     }
+  },
+);
 
-    const order = await razorpay.orders.create({
-      amount: 1000, // ₹10.00, amount is in paise
-      currency: 'INR',
-      receipt: `chatapp_${Date.now()}`,
-    });
+app.post(
+  '/payments/verify',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const {
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+      } = req.body;
 
-    return res.json({
-      orderId: order.id,
-      amount: order.amount,
-      currency: order.currency,
-      keyId: process.env.RAZORPAY_KEY_ID,
-    });
-  } catch (error) {
-    console.error('Create Razorpay order error:', error);
+      if (
+        !razorpay_order_id ||
+        !razorpay_payment_id ||
+        !razorpay_signature
+      ) {
+        return res.status(400).json({
+          message: 'Payment verification details are required',
+        });
+      }
 
-    return res.status(500).json({
-      message: 'Unable to create payment order',
-    });
-  }
-});
+      const paymentRecord = await Payment.findOne({
+        orderId: razorpay_order_id,
+        userId: req.userId,
+      });
 
-// =========================
-// GET CHAT HISTORY
-// =========================
+      if (!paymentRecord) {
+        return res.status(404).json({
+          message: 'Payment order not found for this user',
+        });
+      }
+
+      if (paymentRecord.status === 'paid') {
+        return res.json({
+          message: 'Payment already verified',
+        });
+      }
+
+      const expectedSignature = crypto
+        .createHmac(
+          'sha256',
+          process.env.RAZORPAY_KEY_SECRET,
+        )
+        .update(
+          `${razorpay_order_id}|${razorpay_payment_id}`,
+        )
+        .digest('hex');
+
+      const expectedBuffer = Buffer.from(
+        expectedSignature,
+        'hex',
+      );
+      const receivedBuffer = Buffer.from(
+        razorpay_signature,
+        'hex',
+      );
+
+      if (
+        expectedBuffer.length !== receivedBuffer.length ||
+        !crypto.timingSafeEqual(
+          expectedBuffer,
+          receivedBuffer,
+        )
+      ) {
+        return res.status(400).json({
+          message: 'Invalid payment signature',
+        });
+      }
+
+      const razorpayPayment =
+        await razorpay.payments.fetch(razorpay_payment_id);
+
+      if (
+        razorpayPayment.order_id !== razorpay_order_id ||
+        razorpayPayment.status !== 'captured' ||
+        razorpayPayment.amount !== paymentRecord.amount ||
+        razorpayPayment.currency !== paymentRecord.currency
+      ) {
+        return res.status(400).json({
+          message: 'Payment is not captured or details do not match',
+        });
+      }
+
+      const user = await User.findById(req.userId);
+
+      if (!user) {
+        return res.status(404).json({
+          message: 'User not found',
+        });
+      }
+
+      paymentRecord.paymentId = razorpay_payment_id;
+      paymentRecord.status = 'paid';
+      await paymentRecord.save();
+
+      user.isPremium = true;
+      user.premiumOrderId = razorpay_order_id;
+      user.premiumPaymentId = razorpay_payment_id;
+      user.premiumUntil = new Date(
+        Date.now() + 30 * 24 * 60 * 60 * 1000,
+      );
+
+      await user.save();
+
+      return res.json({
+        message: 'Payment verified. Premium activated!',
+        isPremium: user.isPremium,
+        premiumUntil: user.premiumUntil,
+      });
+    } catch (error) {
+      console.error('Payment verification error:', error);
+
+      return res.status(500).json({
+        message: 'Unable to verify payment',
+      });
+    }
+  },
+);
 
 // =========================
 // GET CHAT HISTORY
