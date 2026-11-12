@@ -1,6 +1,5 @@
 
 import React, {useState} from 'react';
-
 import {
   View,
   Text,
@@ -19,6 +18,8 @@ import {Mail, Lock} from 'lucide-react-native';
 
 import type {NativeStackScreenProps} from '@react-navigation/native-stack';
 import type {RootStackParamList} from '../navigation/AppNavigator';
+
+import * as Keychain from 'react-native-keychain';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Login'>;
 
@@ -43,8 +44,6 @@ const LoginScreen = ({navigation}: Props) => {
     setLoading(true);
 
     try {
-      console.log('LOGIN: Request started');
-
       const response = await fetch(`${API_URL}/login`, {
         method: 'POST',
         headers: {
@@ -62,20 +61,14 @@ const LoginScreen = ({navigation}: Props) => {
       console.log('LOGIN HTTP STATUS:', response.status);
       console.log('LOGIN RAW RESPONSE:', responseText);
 
-      let data: {
-        message?: string;
-        userId?: string;
-        name?: string;
-        email?: string;
-      };
+      let data: any;
 
       try {
         data = JSON.parse(responseText);
       } catch {
-        console.log('LOGIN ERROR: Server returned non-JSON response');
         Alert.alert(
           'Server response error',
-          'Backend returned an unexpected response. Check the Metro and backend terminal logs.',
+          'Backend returned an unexpected response.',
         );
         return;
       }
@@ -83,27 +76,40 @@ const LoginScreen = ({navigation}: Props) => {
       if (!response.ok) {
         Alert.alert(
           'Login failed',
-          data.message || `Request failed (${response.status})`,
+          data?.message || `Request failed (${response.status})`,
         );
         return;
       }
 
-      if (!data.userId) {
-        Alert.alert('Login failed', 'Server did not return a user ID.');
+      // Backend sends: { message, user: { _id, name, email } }
+      const userId = String(data?.user?._id ?? data?.userId ?? '').trim();
+
+      if (!userId) {
+        console.log('LOGIN RESPONSE HAS NO USER ID:', data);
+        Alert.alert('Login failed', 'Server response mein user ID nahi mili.');
         return;
       }
 
-      console.log('LOGIN SUCCESS:', data.userId);
+      console.log('LOGIN SUCCESS - USER ID:', userId);
+      
+      const token = data?.token;
 
-      navigation.navigate('Home', {
-        userId: data.userId,
-      });
+if (!token) {
+  Alert.alert('Login Error', 'Authentication token nahi mila.');
+  return;
+}
+
+await Keychain.setGenericPassword(userId, token, {
+  service: 'com.chatapp.auth',
+});
+
+      navigation.replace('Home', {userId});
     } catch (error) {
-      console.log('LOGIN NETWORK ERROR:', error);
+      console.error('LOGIN NETWORK ERROR:', error);
 
       Alert.alert(
         'Connection error',
-        'Could not reach the backend. Confirm your phone and laptop are on the same network and the backend is running.',
+        'Backend se connect nahi ho paya. Internet connection aur backend URL check karo.',
       );
     } finally {
       setLoading(false);
@@ -138,7 +144,6 @@ const LoginScreen = ({navigation}: Props) => {
               <View style={styles.formContainer}>
                 <View style={styles.inputWrapper}>
                   <Mail size={20} color="#FFFFFF" />
-
                   <TextInput
                     style={styles.input}
                     placeholder="Email Address"
@@ -155,7 +160,6 @@ const LoginScreen = ({navigation}: Props) => {
 
                 <View style={styles.inputWrapper}>
                   <Lock size={20} color="#FFFFFF" />
-
                   <TextInput
                     style={styles.input}
                     placeholder="Password"
@@ -201,30 +205,25 @@ const LoginScreen = ({navigation}: Props) => {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#FFFFFF',
+     backgroundColor: PURPLE,
   },
-
   container: {
     flex: 1,
     backgroundColor: PURPLE,
   },
-
   keyboardView: {
     flex: 1,
   },
-
   scrollContainer: {
     flexGrow: 1,
     justifyContent: 'center',
     paddingHorizontal: 28,
     paddingVertical: 40,
   },
-
   brandContainer: {
     alignItems: 'center',
     marginBottom: 40,
   },
-
   brandLogo: {
     fontSize: 54,
     fontWeight: '900',
@@ -232,7 +231,6 @@ const styles = StyleSheet.create({
     letterSpacing: -1.5,
     fontStyle: 'italic',
   },
-
   brandSubtitle: {
     fontSize: 15,
     color: '#F4EFFF',
@@ -240,11 +238,9 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     opacity: 0.9,
   },
-
   formContainer: {
     width: '100%',
   },
-
   inputWrapper: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -256,7 +252,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     height: 58,
   },
-
   input: {
     flex: 1,
     height: '100%',
@@ -264,7 +259,6 @@ const styles = StyleSheet.create({
     fontSize: 15,
     marginLeft: 10,
   },
-
   loginButton: {
     backgroundColor: '#FFFFFF',
     height: 58,
@@ -281,28 +275,23 @@ const styles = StyleSheet.create({
     shadowRadius: 6,
     elevation: 3,
   },
-
   disabledButton: {
     opacity: 0.65,
   },
-
   loginButtonText: {
     color: PURPLE,
     fontSize: 16,
     fontWeight: '700',
   },
-
   registerRedirect: {
     alignItems: 'center',
     marginTop: 22,
     paddingVertical: 10,
   },
-
   redirectText: {
     color: '#F4EFFF',
     fontSize: 14,
   },
-
   boldUnderline: {
     color: '#FFFFFF',
     fontWeight: '700',
@@ -311,4 +300,3 @@ const styles = StyleSheet.create({
 });
 
 export default LoginScreen;
-

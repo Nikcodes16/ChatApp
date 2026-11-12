@@ -1,5 +1,5 @@
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -9,14 +9,40 @@ import {
   StyleSheet,
   KeyboardAvoidingView,
   Platform,
-  Keyboard,
   Alert,
+  Image,
+  Linking,
+  Modal,
+  ActivityIndicator,
 } from 'react-native';
 
 import { RouteProp, useRoute } from '@react-navigation/native';
-import { ArrowLeft, Send, X } from 'lucide-react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  ArrowLeft,
+  Send,
+  X,
+  Paperclip,
+  Image as ImageIcon,
+  Camera,
+  FileText,
+  Video,
+  Music,
+} from 'lucide-react-native';
 
+import {
+  launchCamera,
+  launchImageLibrary,
+  Asset,
+} from 'react-native-image-picker';
+
+import {
+  pick,
+  types,
+  isErrorWithCode,
+  errorCodes,
+} from '@react-native-documents/picker';
+
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import socket from '../services/socket';
 
 type RootStackParamList = {
@@ -29,7 +55,15 @@ type RootStackParamList = {
 };
 
 type ChatRoomRouteProp = RouteProp<RootStackParamList, 'ChatRoom'>;
+
 type MessageStatus = 'sent' | 'delivered' | 'seen';
+
+type AttachmentType =
+  | 'text'
+  | 'image'
+  | 'video'
+  | 'document'
+  | 'audio';
 
 type ReplyPreview = {
   messageId: string | null;
@@ -46,16 +80,20 @@ type Message = {
   replyTo?: ReplyPreview | null;
   isDeleted?: boolean;
   createdAt?: string;
+  type?: AttachmentType;
+  mediaUrl?: string;
+  fileName?: string;
+  mimeType?: string;
+  fileSize?: number;
 };
 
-const PURPLE = '#6C4AB6';
 const API_URL = 'https://chatapp-6xj8.onrender.com';
-const DELETED_MESSAGE_TEXT = 'This message was deleted';
+const PURPLE = '#6C4AB6';
+const DELETED_TEXT = 'This message was deleted';
 
 const normalizeId = (value: unknown): string =>
-  value == null ? '' : String(value);
+  value == null ? '' : String(value).trim();
 
-// TIMESTAMP HELPERS
 const getMessageDate = (item: any): string | undefined => {
   const value =
     item?.createdAt ??
@@ -63,13 +101,11 @@ const getMessageDate = (item: any): string | undefined => {
     item?.created_at ??
     item?.date;
 
-  if (value == null) return undefined;
+  if (!value) return undefined;
 
   const date = new Date(value);
 
-  return Number.isNaN(date.getTime())
-    ? undefined
-    : date.toISOString();
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 };
 
 const getDayKey = (value?: string): string => {
@@ -103,7 +139,7 @@ const getTimelineLabel = (value?: string): string => {
 
   return date.toLocaleDateString('en-IN', {
     day: 'numeric',
-    month: 'long',
+    month: 'short',
     year: 'numeric',
   });
 };
@@ -124,24 +160,17 @@ const getMessageTime = (value?: string): string => {
 
 const sortMessages = (items: Message[]): Message[] =>
   [...items].sort((a, b) => {
-    const timeA = a.createdAt
-      ? new Date(a.createdAt).getTime()
-      : 0;
-    const timeB = b.createdAt
-      ? new Date(b.createdAt).getTime()
-      : 0;
-
-    return timeA - timeB;
+    const first = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+    const second = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+    return first - second;
   });
 
 const normalizeReply = (reply: any): ReplyPreview | null => {
   if (!reply || typeof reply !== 'object') return null;
 
   return {
-    messageId: reply.messageId
-      ? normalizeId(reply.messageId)
-      : null,
-    text: reply.text || '',
+    messageId: reply.messageId ? normalizeId(reply.messageId) : null,
+    text: String(reply.text || ''),
     sender: normalizeId(reply.sender),
   };
 };
@@ -151,22 +180,27 @@ const ChatRoom = ({ navigation }: any) => {
   const { name, currentUserId, chatUserId } = route.params;
   const insets = useSafeAreaInsets();
 
+  const currentId = normalizeId(currentUserId);
+  const otherId = normalizeId(chatUserId);
+
+  // Keep the same deterministic room ID used by the existing app.
   const roomId =
-    normalizeId(currentUserId) < normalizeId(chatUserId)
-      ? `${currentUserId}_${chatUserId}`
-      : `${chatUserId}_${currentUserId}`;
+    currentId < otherId
+      ? `${currentId}_${otherId}`
+      : `${otherId}_${currentId}`;
 
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
-  const [isChatUserOnline, setIsChatUserOnline] = useState(false);
-  const [isOtherTyping, setIsOtherTyping] = useState(false);
+  const [isOnline, setIsOnline] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [attachmentMenuVisible, setAttachmentMenuVisible] = useState(false);
+  const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(true);
 
   const flatListRef = useRef<FlatList<Message>>(null);
-  const seenMessagesRef = useRef<Set<string>>(new Set());
-  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const historyRequestRef = useRef(0);
 
   const stopTyping = useCallback(() => {
     if (typingTimerRef.current) {
@@ -176,299 +210,240 @@ const ChatRoom = ({ navigation }: any) => {
 
     socket.emit('typing', {
       roomId,
-      userId: currentUserId,
+      userId: currentId,
       isTyping: false,
     });
-  }, [roomId, currentUserId]);
+  }, [roomId, currentId]);
 
-  // REPLY HELPERS
-  const getReplySenderId = (item: Message) =>
-    item.sender === 'me'
-      ? normalizeId(currentUserId)
-      : normalizeId(chatUserId);
+  const formatDatabaseMessage = useCallback(
+    (item: any): Message => ({
+      id: normalizeId(item?._id ?? item?.id),
+      text: item?.isDeleted
+        ? DELETED_TEXT
+        : String(item?.text ?? ''),
+      sender:
+        normalizeId(item?.sender) === currentId ? 'me' : 'other',
+      roomId: normalizeId(item?.roomId),
+      status: item?.status || 'sent',
+      replyTo: normalizeReply(item?.replyTo),
+      isDeleted: Boolean(item?.isDeleted),
+      createdAt: getMessageDate(item),
+      type: item?.type || 'text',
+      mediaUrl: item?.mediaUrl || '',
+      fileName: item?.fileName || '',
+      mimeType: item?.mimeType || '',
+      fileSize: Number(item?.fileSize || 0),
+    }),
+    [currentId],
+  );
 
-  const makeReplyPreview = (item: Message): ReplyPreview => ({
-    messageId: normalizeId(item.id),
-    text: item.isDeleted ? DELETED_MESSAGE_TEXT : item.text,
-    sender: getReplySenderId(item),
-  });
-
-  const getReplySenderLabel = (senderId: string) => {
-    if (normalizeId(senderId) === normalizeId(currentUserId)) {
-      return 'You';
-    }
-
-    if (normalizeId(senderId) === normalizeId(chatUserId)) {
-      return name;
-    }
-
-    return 'Reply';
-  };
-
-  // FORMAT DATABASE MESSAGE
-  const formatDatabaseMessage = (item: any): Message => ({
-    id: normalizeId(item._id ?? item.id),
-    text: item.isDeleted
-      ? DELETED_MESSAGE_TEXT
-      : String(item.text ?? ''),
-    sender:
-      normalizeId(item.sender) === normalizeId(currentUserId)
-        ? 'me'
-        : 'other',
-    roomId: normalizeId(item.roomId),
-    status: item.status || 'sent',
-    replyTo: normalizeReply(item.replyTo),
-    isDeleted: Boolean(item.isDeleted),
-    createdAt: getMessageDate(item),
-  });
-
+  // =========================
   // LOAD CHAT HISTORY
-  useEffect(() => {
-    let isMounted = true;
+  // =========================
 
-    const loadMessages = async () => {
+  const loadMessages = useCallback(async () => {
+    const requestId = ++historyRequestRef.current;
+
+    setHistoryLoading(true);
+
+    const url =
+      `${API_URL}/messages?roomId=${encodeURIComponent(roomId)}` +
+      `&userId=${encodeURIComponent(currentId)}`;
+
+    console.log('========== CHAT HISTORY REQUEST ==========');
+    console.log('CHAT USER:', name);
+    console.log('CURRENT USER ID:', currentId);
+    console.log('OTHER USER ID:', otherId);
+    console.log('ROOM ID:', roomId);
+    console.log('HISTORY URL:', url);
+
+    try {
+      const response = await fetch(url);
+      const responseText = await response.text();
+
+      console.log('CHAT HISTORY HTTP STATUS:', response.status);
+      console.log('CHAT HISTORY RAW RESPONSE:', responseText);
+
+      let data: any;
+
       try {
-        const response = await fetch(
-          `${API_URL}/messages?roomId=${encodeURIComponent(
-            roomId,
-          )}&userId=${encodeURIComponent(currentUserId)}`,
+        data = JSON.parse(responseText);
+      } catch {
+        throw new Error(
+          `Server returned invalid JSON (HTTP ${response.status})`,
         );
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        if (!isMounted || !Array.isArray(data)) return;
-
-        const formattedMessages = sortMessages(
-          data
-            .map(formatDatabaseMessage)
-            .filter((item: Message) => item.id.length > 0),
-        );
-
-        setMessages(formattedMessages);
-
-        seenMessagesRef.current = new Set(
-          formattedMessages
-            .filter(item => item.status === 'seen')
-            .map(item => item.id),
-        );
-
-        setTimeout(() => {
-          if (isMounted) {
-            flatListRef.current?.scrollToEnd({
-              animated: false,
-            });
-          }
-        }, 100);
-      } catch (error) {
-        console.log('Messages fetch error:', error);
       }
-    };
 
+      if (!response.ok) {
+        throw new Error(
+          data?.message || `History request failed: ${response.status}`,
+        );
+      }
+
+      if (!Array.isArray(data)) {
+        throw new Error('History API response is not an array');
+      }
+
+      const formatted = sortMessages(
+        data
+          .map(formatDatabaseMessage)
+          .filter((item: Message) => Boolean(item.id)),
+      );
+
+      console.log('CHAT HISTORY ARRAY COUNT:', data.length);
+      console.log('CHAT HISTORY FORMATTED COUNT:', formatted.length);
+      console.log(
+        'CHAT HISTORY ROOM IDS:',
+        [...new Set(data.map((item: any) => normalizeId(item?.roomId)))],
+      );
+
+      // Ignore results from an older request if the screen was refreshed.
+      if (requestId !== historyRequestRef.current) return;
+
+      setMessages(previous => {
+        // Preserve any messages received through Socket.IO while history loaded.
+        const byId = new Map<string, Message>();
+
+        formatted.forEach(item => byId.set(item.id, item));
+        previous.forEach(item => {
+          if (!byId.has(item.id)) {
+            byId.set(item.id, item);
+          }
+        });
+
+        return sortMessages(Array.from(byId.values()));
+      });
+    } catch (error: any) {
+      console.error('========== CHAT HISTORY ERROR ==========');
+      console.error('ROOM ID:', roomId);
+      console.error('ERROR:', error?.message || error);
+
+      Alert.alert(
+        'Could not load chat',
+        error?.message || 'Unable to load previous messages.',
+      );
+    } finally {
+      if (requestId === historyRequestRef.current) {
+        setHistoryLoading(false);
+      }
+    }
+  }, [roomId, currentId, otherId, name, formatDatabaseMessage]);
+
+  useEffect(() => {
     loadMessages();
 
     return () => {
-      isMounted = false;
+      // Invalidate requests that finish after this screen is closed.
+      historyRequestRef.current += 1;
     };
-  }, [roomId, currentUserId]);
+  }, [loadMessages]);
 
-  // MARK RECEIVED MESSAGES AS SEEN
-  useEffect(() => {
-    if (!socket.connected) return;
-
-    messages.forEach(item => {
-      if (item.sender !== 'other' || item.isDeleted) return;
-
-      if (
-        item.status === 'seen' ||
-        item.id.startsWith('temp_') ||
-        seenMessagesRef.current.has(item.id)
-      ) {
-        return;
-      }
-
-      seenMessagesRef.current.add(item.id);
-      socket.emit('message_seen', item.id);
-    });
-  }, [messages]);
-
-  // KEYBOARD AUTO SCROLL
-  useEffect(() => {
-    const listener = Keyboard.addListener('keyboardDidShow', () => {
-      setTimeout(() => {
-        flatListRef.current?.scrollToEnd({ animated: true });
-      }, 300);
-    });
-
-    return () => listener.remove();
-  }, []);
-
+  // =========================
   // SOCKET EVENTS
+  // =========================
+
   useEffect(() => {
     const handleConnect = () => {
-      socket.emit('user_online', currentUserId);
+      console.log('CHAT SOCKET CONNECTED');
+      console.log('JOINING CHAT ROOM:', roomId);
+
+      socket.emit('user_online', currentId);
       socket.emit('join_room', roomId);
-      console.log('JOINED ROOM:', roomId);
     };
 
-    // RECEIVE MESSAGE
-    const handleReceiveMessage = (newMessage: any) => {
-      if (normalizeId(newMessage.roomId) !== normalizeId(roomId)) {
-        return;
-      }
+    const handleReceiveMessage = (incoming: any) => {
+      if (normalizeId(incoming?.roomId) !== roomId) return;
 
-      const messageId = normalizeId(
-        newMessage.id ?? newMessage._id,
-      );
+      const id = normalizeId(incoming?.id ?? incoming?._id);
+      if (!id) return;
 
-      if (!messageId) return;
-
-      const receivedMessage: Message = {
-        id: messageId,
-        text: newMessage.isDeleted
-          ? DELETED_MESSAGE_TEXT
-          : String(newMessage.text ?? ''),
+      const formatted: Message = {
+        id,
+        text: incoming?.isDeleted
+          ? DELETED_TEXT
+          : String(incoming?.text ?? ''),
         sender:
-          normalizeId(newMessage.sender) === normalizeId(currentUserId)
-            ? 'me'
-            : 'other',
-        roomId: normalizeId(newMessage.roomId),
-        status: newMessage.status || 'sent',
-        replyTo: normalizeReply(newMessage.replyTo),
-        isDeleted: Boolean(newMessage.isDeleted),
-        createdAt:
-          getMessageDate(newMessage) ?? new Date().toISOString(),
+          normalizeId(incoming?.sender) === currentId ? 'me' : 'other',
+        roomId: normalizeId(incoming?.roomId),
+        status: incoming?.status || 'sent',
+        replyTo: normalizeReply(incoming?.replyTo),
+        isDeleted: Boolean(incoming?.isDeleted),
+        createdAt: getMessageDate(incoming) || new Date().toISOString(),
+        type: incoming?.type || 'text',
+        mediaUrl: incoming?.mediaUrl || '',
+        fileName: incoming?.fileName || '',
+        mimeType: incoming?.mimeType || '',
+        fileSize: Number(incoming?.fileSize || 0),
       };
 
-      setMessages(prev => {
-        const existingIndex = prev.findIndex(
-          item => item.id === messageId,
-        );
+      setMessages(previous => {
+        const existingIndex = previous.findIndex(item => item.id === id);
 
-        if (existingIndex !== -1) {
+        if (existingIndex >= 0) {
           return sortMessages(
-            prev.map(item =>
-              item.id === messageId
-                ? {
-                    ...item,
-                    ...receivedMessage,
-                    createdAt:
-                      receivedMessage.createdAt ?? item.createdAt,
-                    replyTo:
-                      receivedMessage.replyTo ?? item.replyTo,
-                  }
-                : item,
+            previous.map(item =>
+              item.id === id ? { ...item, ...formatted } : item,
             ),
           );
         }
 
-        const tempIndex = prev.findIndex(
-          item =>
-            item.id.startsWith('temp_') &&
-            item.sender === 'me' &&
-            item.text === receivedMessage.text &&
-            item.roomId === receivedMessage.roomId &&
-            normalizeId(newMessage.sender) ===
-              normalizeId(currentUserId),
-        );
-
-        if (tempIndex !== -1) {
-          return sortMessages(
-            prev.map((item, index) =>
-              index === tempIndex
-                ? {
-                    ...item,
-                    ...receivedMessage,
-                    createdAt:
-                      receivedMessage.createdAt ?? item.createdAt,
-                    replyTo:
-                      receivedMessage.replyTo ?? item.replyTo,
-                  }
-                : item,
-            ),
-          );
-        }
-
-        return sortMessages([...prev, receivedMessage]);
+        return sortMessages([...previous, formatted]);
       });
 
-      if (receivedMessage.sender === 'other') {
-        socket.emit('message_delivered', messageId);
+      if (formatted.sender === 'other') {
+        socket.emit('message_delivered', id);
       }
-
-      setTimeout(() => {
-        flatListRef.current?.scrollToEnd({ animated: true });
-      }, 100);
     };
 
-    // MESSAGE SAVED ON SERVER
-    const handleMessageSent = (savedMessage: any) => {
-      const savedId = normalizeId(
-        savedMessage.id ?? savedMessage._id,
-      );
-
+    const handleMessageSent = (saved: any) => {
+      const savedId = normalizeId(saved?.id ?? saved?._id);
       if (!savedId) return;
 
-      const savedRoomId = normalizeId(savedMessage.roomId);
-
-      if (savedRoomId && savedRoomId !== normalizeId(roomId)) {
+      if (saved?.roomId && normalizeId(saved.roomId) !== roomId) {
         return;
       }
 
-      const savedReply = normalizeReply(savedMessage.replyTo);
+      const tempId = normalizeId(saved?.clientTempId);
 
-      setMessages(prev => {
-        const existingIndex = prev.findIndex(
-          item => item.id === savedId,
-        );
+      setMessages(previous => {
+        const alreadySaved = previous.some(item => item.id === savedId);
 
-        if (existingIndex !== -1) {
+        if (alreadySaved) {
           return sortMessages(
-            prev.map(item =>
+            previous.map(item =>
               item.id === savedId
                 ? {
                     ...item,
-                    text: savedMessage.isDeleted
-                      ? DELETED_MESSAGE_TEXT
-                      : String(savedMessage.text ?? item.text),
-                    status: savedMessage.status || item.status,
-                    replyTo: savedReply ?? item.replyTo,
-                    isDeleted: Boolean(savedMessage.isDeleted),
-                    createdAt:
-                      getMessageDate(savedMessage) ?? item.createdAt,
+                    status: saved?.status || 'sent',
+                    createdAt: getMessageDate(saved) || item.createdAt,
                   }
                 : item,
             ),
           );
         }
 
-        const tempIndex = prev.findIndex(
-          item =>
-            item.id.startsWith('temp_') &&
-            item.sender === 'me' &&
-            item.text === String(savedMessage.text ?? '') &&
-            item.roomId === (savedRoomId || roomId),
-        );
+        const tempIndex = previous.findIndex(item => {
+          if (!item.id.startsWith('temp_')) return false;
+          if (tempId) return item.id === tempId;
 
-        if (tempIndex === -1) return prev;
+          return (
+            item.sender === 'me' &&
+            item.roomId === roomId &&
+            item.text === String(saved?.text ?? '') &&
+            (item.type || 'text') === (saved?.type || 'text')
+          );
+        });
+
+        if (tempIndex < 0) return previous;
 
         return sortMessages(
-          prev.map((item, index) =>
+          previous.map((item, index) =>
             index === tempIndex
               ? {
                   ...item,
                   id: savedId,
-                  text: savedMessage.isDeleted
-                    ? DELETED_MESSAGE_TEXT
-                    : String(savedMessage.text ?? item.text),
-                  status: savedMessage.status || item.status,
-                  replyTo: savedReply ?? item.replyTo,
-                  isDeleted: Boolean(savedMessage.isDeleted),
-                  createdAt:
-                    getMessageDate(savedMessage) ?? item.createdAt,
+                  status: saved?.status || 'sent',
+                  createdAt: getMessageDate(saved) || item.createdAt,
                 }
               : item,
           ),
@@ -476,119 +451,84 @@ const ChatRoom = ({ navigation }: any) => {
       });
     };
 
-    // SENT / DELIVERED / SEEN STATUS
-    const handleMessageStatus = (data: {
-      messageId: string;
-      status: MessageStatus;
-    }) => {
-      setMessages(prev =>
-        prev.map(item =>
-          normalizeId(item.id) === normalizeId(data.messageId)
-            ? { ...item, status: data.status }
+    const handleMessageStatus = (data: any) => {
+      setMessages(previous =>
+        previous.map(item =>
+          item.id === normalizeId(data?.messageId)
+            ? { ...item, status: data?.status }
             : item,
         ),
       );
     };
 
-    // DELETE FOR EVERYONE
-    const handleMessageDeleted = (data: {
-      messageId: string;
-      roomId: string;
-      text?: string;
-      isDeleted?: boolean;
-    }) => {
-      if (normalizeId(data.roomId) !== normalizeId(roomId)) return;
+    const handleMessageDeleted = (data: any) => {
+      if (normalizeId(data?.roomId) !== roomId) return;
 
-      const deletedId = normalizeId(data.messageId);
-      if (!deletedId) return;
+      const id = normalizeId(data?.messageId);
 
-      const deletedText = data.text || DELETED_MESSAGE_TEXT;
-
-      setMessages(prev =>
-        prev.map(item =>
-          normalizeId(item.id) === deletedId
-            ? { ...item, text: deletedText, isDeleted: true }
+      setMessages(previous =>
+        previous.map(item =>
+          item.id === id
+            ? {
+                ...item,
+                text: data?.text || DELETED_TEXT,
+                isDeleted: true,
+              }
             : item,
         ),
       );
 
-      setReplyingTo(prev =>
-        prev && normalizeId(prev.id) === deletedId
-          ? { ...prev, text: deletedText, isDeleted: true }
-          : prev,
+      setReplyingTo(previous =>
+        previous && previous.id === id
+          ? { ...previous, text: DELETED_TEXT, isDeleted: true }
+          : previous,
       );
     };
 
-    // DELETE FOR ME
-    const handleMessageDeletedForMe = (data: {
-      messageId: string;
-      roomId: string;
-      userId: string;
-    }) => {
+    const handleMessageDeletedForMe = (data: any) => {
       if (
-        normalizeId(data.roomId) !== normalizeId(roomId) ||
-        normalizeId(data.userId) !== normalizeId(currentUserId)
+        normalizeId(data?.roomId) !== roomId ||
+        normalizeId(data?.userId) !== currentId
       ) {
         return;
       }
 
-      const deletedId = normalizeId(data.messageId);
-      if (!deletedId) return;
+      const id = normalizeId(data?.messageId);
 
-      setMessages(prev =>
-        prev.filter(item => normalizeId(item.id) !== deletedId),
-      );
+      setMessages(previous => previous.filter(item => item.id !== id));
 
-      setReplyingTo(prev =>
-        prev && normalizeId(prev.id) === deletedId ? null : prev,
+      setReplyingTo(previous =>
+        previous && previous.id === id ? null : previous,
       );
     };
 
-    // DELETE ERROR
-    const handleDeleteMessageError = (data: {
-      message?: string;
-    }) => {
+    const handleDeleteError = (data: any) => {
       Alert.alert(
-        'Unable to delete message',
-        data?.message || 'Please try again.',
+        'Delete failed',
+        data?.message || 'Could not delete this message.',
       );
     };
 
-    // ONLINE / OFFLINE
-    const handleUserStatus = (data: {
-      userId: string;
-      online: boolean;
-    }) => {
-      if (normalizeId(data.userId) === normalizeId(chatUserId)) {
-        setIsChatUserOnline(data.online);
+    const handleUserStatus = (data: any) => {
+      if (normalizeId(data?.userId) === otherId) {
+        setIsOnline(Boolean(data?.online));
       }
     };
 
     const handleOnlineUsers = (userIds: string[]) => {
-      setIsChatUserOnline(
+      setIsOnline(
         Array.isArray(userIds) &&
-          userIds.some(
-            id => normalizeId(id) === normalizeId(chatUserId),
-          ),
+          userIds.some(id => normalizeId(id) === otherId),
       );
     };
 
-    // TYPING INDICATOR
-    const handleUserTyping = (data: {
-      roomId: string;
-      userId: string;
-      isTyping: boolean;
-    }) => {
+    const handleTyping = (data: any) => {
       if (
-        normalizeId(data.roomId) === normalizeId(roomId) &&
-        normalizeId(data.userId) === normalizeId(chatUserId)
+        normalizeId(data?.roomId) === roomId &&
+        normalizeId(data?.userId) === otherId
       ) {
-        setIsOtherTyping(data.isTyping);
+        setIsTyping(Boolean(data?.isTyping));
       }
-    };
-
-    const handleConnectError = (error: Error) => {
-      console.log('SOCKET ERROR:', error.message);
     };
 
     socket.on('connect', handleConnect);
@@ -597,13 +537,14 @@ const ChatRoom = ({ navigation }: any) => {
     socket.on('message_status', handleMessageStatus);
     socket.on('message_deleted', handleMessageDeleted);
     socket.on('message_deleted_for_me', handleMessageDeletedForMe);
-    socket.on('delete_message_error', handleDeleteMessageError);
+    socket.on('delete_message_error', handleDeleteError);
     socket.on('user_status', handleUserStatus);
     socket.on('online_users', handleOnlineUsers);
-    socket.on('user_typing', handleUserTyping);
-    socket.on('connect_error', handleConnectError);
+    socket.on('user_typing', handleTyping);
 
-    if (socket.connected) handleConnect();
+    if (socket.connected) {
+      handleConnect();
+    }
 
     return () => {
       socket.off('connect', handleConnect);
@@ -612,11 +553,10 @@ const ChatRoom = ({ navigation }: any) => {
       socket.off('message_status', handleMessageStatus);
       socket.off('message_deleted', handleMessageDeleted);
       socket.off('message_deleted_for_me', handleMessageDeletedForMe);
-      socket.off('delete_message_error', handleDeleteMessageError);
+      socket.off('delete_message_error', handleDeleteError);
       socket.off('user_status', handleUserStatus);
       socket.off('online_users', handleOnlineUsers);
-      socket.off('user_typing', handleUserTyping);
-      socket.off('connect_error', handleConnectError);
+      socket.off('user_typing', handleTyping);
 
       if (typingTimerRef.current) {
         clearTimeout(typingTimerRef.current);
@@ -625,34 +565,34 @@ const ChatRoom = ({ navigation }: any) => {
 
       socket.emit('typing', {
         roomId,
-        userId: currentUserId,
+        userId: currentId,
         isTyping: false,
       });
-
-      setIsOtherTyping(false);
     };
-  }, [roomId, currentUserId, chatUserId, name]);
+  }, [roomId, currentId, otherId]);
 
-  // HANDLE TYPING
-  const handleTyping = (text: string) => {
+  // =========================
+  // TYPING INDICATOR
+  // =========================
+
+  const handleTypingChange = (text: string) => {
     setMessage(text);
 
     socket.emit('typing', {
       roomId,
-      userId: currentUserId,
-      isTyping: text.trim().length > 0,
+      userId: currentId,
+      isTyping: Boolean(text.trim()),
     });
 
     if (typingTimerRef.current) {
       clearTimeout(typingTimerRef.current);
-      typingTimerRef.current = null;
     }
 
-    if (text.trim().length > 0) {
+    if (text.trim()) {
       typingTimerRef.current = setTimeout(() => {
         socket.emit('typing', {
           roomId,
-          userId: currentUserId,
+          userId: currentId,
           isTyping: false,
         });
 
@@ -661,7 +601,14 @@ const ChatRoom = ({ navigation }: any) => {
     }
   };
 
-  // REPLY TO MESSAGE
+  const makeReplyPreview = (item: Message): ReplyPreview => ({
+    messageId: item.id,
+    text: item.isDeleted
+      ? DELETED_TEXT
+      : item.text || item.fileName || 'Attachment',
+    sender: item.sender === 'me' ? currentId : otherId,
+  });
+
   const handleReply = (item: Message) => {
     if (item.id.startsWith('temp_')) {
       Alert.alert('Please wait', 'This message is still being sent.');
@@ -671,40 +618,8 @@ const ChatRoom = ({ navigation }: any) => {
     setReplyingTo(item);
   };
 
-  // DELETE FOR ME
-  const handleDeleteForMe = (item: Message) => {
-    if (item.id.startsWith('temp_')) {
-      Alert.alert('Please wait', 'This message is still being sent.');
-      return;
-    }
-
-    Alert.alert(
-      'Delete for me?',
-      'This message will be removed only from your chat.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete for me',
-          style: 'destructive',
-          onPress: () => {
-            socket.emit('delete_message_for_me', {
-              messageId: normalizeId(item.id),
-              userId: normalizeId(currentUserId),
-              roomId: normalizeId(roomId),
-            });
-          },
-        },
-      ],
-    );
-  };
-
-  // DELETE FOR EVERYONE
-  const handleDeleteMessage = (item: Message) => {
-    if (
-      item.sender !== 'me' ||
-      item.id.startsWith('temp_') ||
-      item.isDeleted
-    ) {
+  const handleDeleteForEveryone = (item: Message) => {
+    if (item.sender !== 'me' || item.id.startsWith('temp_') || item.isDeleted) {
       return;
     }
 
@@ -718,9 +633,9 @@ const ChatRoom = ({ navigation }: any) => {
           style: 'destructive',
           onPress: () => {
             socket.emit('delete_message', {
-              messageId: normalizeId(item.id),
-              userId: normalizeId(currentUserId),
-              roomId: normalizeId(roomId),
+              messageId: item.id,
+              userId: currentId,
+              roomId,
             });
           },
         },
@@ -728,11 +643,33 @@ const ChatRoom = ({ navigation }: any) => {
     );
   };
 
-  // LONG-PRESS MESSAGE MENU
+  const handleDeleteForMe = (item: Message) => {
+    if (item.id.startsWith('temp_')) return;
+
+    Alert.alert(
+      'Delete for me?',
+      'This message will be removed only from your chat.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete for me',
+          style: 'destructive',
+          onPress: () => {
+            socket.emit('delete_message_for_me', {
+              messageId: item.id,
+              userId: currentId,
+              roomId,
+            });
+          },
+        },
+      ],
+    );
+  };
+
   const handleLongPress = (item: Message) => {
     if (item.isDeleted || item.id.startsWith('temp_')) return;
 
-    const buttons: any[] = [
+    const actions: any[] = [
       { text: 'Reply', onPress: () => handleReply(item) },
       {
         text: 'Delete for me',
@@ -742,66 +679,66 @@ const ChatRoom = ({ navigation }: any) => {
     ];
 
     if (item.sender === 'me') {
-      buttons.push({
+      actions.push({
         text: 'Delete for everyone',
         style: 'destructive',
-        onPress: () => handleDeleteMessage(item),
+        onPress: () => handleDeleteForEveryone(item),
       });
     }
 
-    buttons.push({ text: 'Cancel', style: 'cancel' });
+    actions.push({ text: 'Cancel', style: 'cancel' });
 
-    Alert.alert('Message options', 'Choose an action', buttons);
+    Alert.alert('Message options', 'Choose an action', actions);
   };
 
-  // SEND MESSAGE
+  // =========================
+  // SEND TEXT MESSAGE
+  // =========================
+
   const sendMessage = () => {
     const text = message.trim();
+
     if (!text) return;
 
     if (!socket.connected) {
       Alert.alert(
         'Connection unavailable',
-        'Please wait for the chat to reconnect, then try again.',
+        'Please wait for the chat to reconnect.',
       );
       return;
     }
 
     stopTyping();
 
-    const temporaryId = `temp_${Date.now()}`;
-    const replyPreview = replyingTo
-      ? makeReplyPreview(replyingTo)
-      : null;
+    const tempId =
+      `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const createdAt = new Date().toISOString();
+    const replyTo = replyingTo ? makeReplyPreview(replyingTo) : null;
 
-    const newMessage = {
-      id: temporaryId,
-      clientTempId: temporaryId,
+    const optimisticMessage: Message = {
+      id: tempId,
       text,
-      sender: normalizeId(currentUserId),
-      receiver: normalizeId(chatUserId),
+      sender: 'me',
       roomId,
-      replyTo: replyPreview,
+      status: 'sent',
+      replyTo,
       createdAt,
+      type: 'text',
     };
 
-    setMessages(prev =>
-      sortMessages([
-        ...prev,
-        {
-          id: temporaryId,
-          text,
-          sender: 'me',
-          roomId,
-          status: 'sent',
-          replyTo: replyPreview,
-          createdAt,
-        },
-      ]),
-    );
+    setMessages(previous => sortMessages([...previous, optimisticMessage]));
 
-    socket.emit('send_message', newMessage);
+    socket.emit('send_message', {
+      id: tempId,
+      clientTempId: tempId,
+      text,
+      sender: currentId,
+      receiver: otherId,
+      roomId,
+      replyTo,
+      createdAt,
+    });
+
     setMessage('');
     setReplyingTo(null);
 
@@ -810,14 +747,227 @@ const ChatRoom = ({ navigation }: any) => {
     }, 100);
   };
 
-  // MESSAGE STATUS TEXT
-  const getStatusText = (status: MessageStatus) => {
-    if (status === 'delivered') return '✓✓ delivered';
-    if (status === 'seen') return '✓✓ seen';
-    return '✓ sent';
+  // =========================
+  // UPLOAD AND SEND ATTACHMENT
+  // =========================
+
+  const uploadAndSendAttachment = async (
+    asset: Asset,
+    forcedType?: 'image' | 'video' | 'document' | 'audio',
+  ) => {
+    if (!asset.uri) {
+      Alert.alert('Upload failed', 'The selected file has no URI.');
+      return;
+    }
+
+    if (!socket.connected) {
+      Alert.alert(
+        'Connection unavailable',
+        'Please wait for the chat to reconnect.',
+      );
+      return;
+    }
+
+    setAttachmentMenuVisible(false);
+    setUploadingAttachment(true);
+
+    const mimeType = asset.type || 'application/octet-stream';
+
+    const type: 'image' | 'video' | 'document' | 'audio' =
+      forcedType ||
+      (mimeType.startsWith('image/')
+        ? 'image'
+        : mimeType.startsWith('video/')
+          ? 'video'
+          : mimeType.startsWith('audio/')
+            ? 'audio'
+            : 'document');
+
+    try {
+      const formData = new FormData();
+
+      formData.append(
+        'file',
+        {
+          uri: asset.uri,
+          name: asset.fileName || `attachment_${Date.now()}`,
+          type: mimeType,
+        } as any,
+      );
+
+      const response = await fetch(
+        `${API_URL}/upload/chat-media/${encodeURIComponent(currentId)}`,
+        {
+          method: 'POST',
+          body: formData,
+        },
+      );
+
+      const responseText = await response.text();
+
+      console.log('Attachment upload status:', response.status);
+      console.log('Attachment upload response:', responseText);
+
+      let uploaded: any;
+
+      try {
+        uploaded = JSON.parse(responseText);
+      } catch {
+        throw new Error(
+          `Invalid upload response (HTTP ${response.status}): ${responseText.slice(0, 200)}`,
+        );
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          uploaded?.message || `Upload failed: ${response.status}`,
+        );
+      }
+
+      if (
+        typeof uploaded.mediaUrl !== 'string' ||
+        !uploaded.mediaUrl.trim()
+      ) {
+        throw new Error('The server did not return a media URL.');
+      }
+
+      const tempId =
+        `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const createdAt = new Date().toISOString();
+      const fileName = uploaded.fileName || asset.fileName || 'Attachment';
+      const finalMimeType = uploaded.mimeType || mimeType;
+      const fileSize = Number(uploaded.fileSize ?? asset.fileSize ?? 0);
+      const replyTo = replyingTo ? makeReplyPreview(replyingTo) : null;
+
+      const optimisticMessage: Message = {
+        id: tempId,
+        text: '',
+        sender: 'me',
+        roomId,
+        status: 'sent',
+        replyTo,
+        createdAt,
+        type,
+        mediaUrl: uploaded.mediaUrl,
+        fileName,
+        mimeType: finalMimeType,
+        fileSize,
+      };
+
+      setMessages(previous => sortMessages([...previous, optimisticMessage]));
+
+      socket.emit('send_message', {
+        id: tempId,
+        clientTempId: tempId,
+        text: '',
+        sender: currentId,
+        receiver: otherId,
+        roomId,
+        replyTo,
+        type,
+        mediaUrl: uploaded.mediaUrl,
+        fileName,
+        mimeType: finalMimeType,
+        fileSize,
+        createdAt,
+      });
+
+      setReplyingTo(null);
+
+      setTimeout(() => {
+        flatListRef.current?.scrollToEnd({ animated: true });
+      }, 100);
+    } catch (error: any) {
+      console.error('Attachment upload error:', error);
+
+      Alert.alert(
+        'Attachment failed',
+        error?.message || 'Could not upload the selected file.',
+      );
+    } finally {
+      setUploadingAttachment(false);
+    }
   };
 
-  // RENDER MESSAGE WITH TIMELINE
+  const chooseGallery = async () => {
+    setAttachmentMenuVisible(false);
+
+    try {
+      const result = await launchImageLibrary({
+        mediaType: 'mixed',
+        selectionLimit: 1,
+      });
+
+      if (result.didCancel || !result.assets?.[0]) return;
+
+      await uploadAndSendAttachment(result.assets[0]);
+    } catch (error) {
+      console.error('Gallery error:', error);
+      Alert.alert('Gallery error', 'Could not open the gallery.');
+    }
+  };
+
+  const takePhoto = async () => {
+    setAttachmentMenuVisible(false);
+
+    try {
+      const result = await launchCamera({
+        mediaType: 'photo',
+        saveToPhotos: true,
+      });
+
+      if (result.didCancel || !result.assets?.[0]) return;
+
+      await uploadAndSendAttachment(result.assets[0], 'image');
+    } catch (error) {
+      console.error('Camera error:', error);
+      Alert.alert('Camera error', 'Could not open the camera.');
+    }
+  };
+
+  const chooseDocument = async () => {
+    setAttachmentMenuVisible(false);
+
+    try {
+      const result = await pick({ type: [types.allFiles] });
+      const file = result[0];
+
+      if (!file?.uri) return;
+
+      const asset: Asset = {
+        uri: file.uri,
+        fileName: file.name || 'Document',
+        type: file.type || 'application/octet-stream',
+        fileSize: file.size ?? undefined,
+      };
+
+      await uploadAndSendAttachment(asset);
+    } catch (error) {
+      if (
+        isErrorWithCode(error) &&
+        error.code === errorCodes.OPERATION_CANCELED
+      ) {
+        return;
+      }
+
+      console.error('Document picker error:', error);
+      Alert.alert('Document error', 'Could not select or upload the document.');
+    }
+  };
+
+  const openAttachment = async (url: string) => {
+    try {
+      await Linking.openURL(url);
+    } catch (error) {
+      console.error('Open attachment error:', error);
+      Alert.alert('Error', 'Could not open this attachment.');
+    }
+  };
+
+  // =========================
+  // RENDER MESSAGE
+  // =========================
+
   const renderMessage = ({
     item,
     index,
@@ -826,13 +976,15 @@ const ChatRoom = ({ navigation }: any) => {
     index: number;
   }) => {
     const isMe = item.sender === 'me';
-    const previousMessage = messages[index - 1];
+    const previous = messages[index - 1];
 
     const showDate =
-      !!item.createdAt &&
+      Boolean(item.createdAt) &&
       (index === 0 ||
-        getDayKey(item.createdAt) !==
-          getDayKey(previousMessage?.createdAt));
+        getDayKey(item.createdAt) !== getDayKey(previous?.createdAt));
+
+    const replySender =
+      normalizeId(item.replyTo?.sender) === currentId ? 'You' : name;
 
     return (
       <View>
@@ -846,12 +998,7 @@ const ChatRoom = ({ navigation }: any) => {
           </View>
         )}
 
-        <View
-          style={[
-            styles.messageRow,
-            isMe ? styles.myRow : styles.otherRow,
-          ]}
-        >
+        <View style={[styles.messageRow, isMe ? styles.myRow : styles.otherRow]}>
           <TouchableOpacity
             activeOpacity={0.9}
             onLongPress={() => handleLongPress(item)}
@@ -865,21 +1012,17 @@ const ChatRoom = ({ navigation }: any) => {
               <View
                 style={[
                   styles.replyPreviewInBubble,
-                  isMe
-                    ? styles.replyPreviewMine
-                    : styles.replyPreviewOther,
+                  isMe ? styles.replyPreviewMine : styles.replyPreviewOther,
                 ]}
               >
                 <Text
                   style={[
                     styles.replySender,
-                    isMe
-                      ? styles.replySenderMine
-                      : styles.replySenderOther,
+                    isMe ? styles.replySenderMine : styles.replySenderOther,
                   ]}
                   numberOfLines={1}
                 >
-                  {getReplySenderLabel(item.replyTo.sender)}
+                  {replySender}
                 </Text>
 
                 <Text
@@ -894,29 +1037,90 @@ const ChatRoom = ({ navigation }: any) => {
               </View>
             )}
 
-            <Text
-              style={[
-                styles.messageText,
-                isMe ? styles.myText : styles.otherText,
-                item.isDeleted && styles.deletedText,
-              ]}
-            >
-              {item.isDeleted ? DELETED_MESSAGE_TEXT : item.text}
-            </Text>
+            {!item.isDeleted && item.type === 'image' && item.mediaUrl ? (
+              <TouchableOpacity onPress={() => openAttachment(item.mediaUrl!)}>
+                <Image
+                  source={{ uri: item.mediaUrl }}
+                  style={styles.attachmentImage}
+                  resizeMode="cover"
+                />
+              </TouchableOpacity>
+            ) : null}
 
-            <View style={styles.messageMeta}>
+            {!item.isDeleted && item.type === 'video' && item.mediaUrl ? (
+              <TouchableOpacity
+                style={styles.fileAttachment}
+                onPress={() => openAttachment(item.mediaUrl!)}
+              >
+                <Video size={24} color={isMe ? '#FFFFFF' : PURPLE} />
+                <View style={styles.fileAttachmentText}>
+                  <Text
+                    style={[styles.fileName, isMe && styles.myText]}
+                    numberOfLines={2}
+                  >
+                    {item.fileName || 'Video'}
+                  </Text>
+                  <Text style={[styles.fileHint, isMe && styles.myText]}>
+                    Tap to open video
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            ) : null}
+
+            {!item.isDeleted &&
+            (item.type === 'document' || item.type === 'audio') &&
+            item.mediaUrl ? (
+              <TouchableOpacity
+                style={styles.fileAttachment}
+                onPress={() => openAttachment(item.mediaUrl!)}
+              >
+                {item.type === 'audio' ? (
+                  <Music size={24} color={isMe ? '#FFFFFF' : PURPLE} />
+                ) : (
+                  <FileText size={24} color={isMe ? '#FFFFFF' : PURPLE} />
+                )}
+
+                <View style={styles.fileAttachmentText}>
+                  <Text
+                    style={[styles.fileName, isMe && styles.myText]}
+                    numberOfLines={2}
+                  >
+                    {item.fileName || 'Document'}
+                  </Text>
+                  <Text style={[styles.fileHint, isMe && styles.myText]}>
+                    {item.fileSize
+                      ? `${(item.fileSize / 1024).toFixed(0)} KB · `
+                      : ''}
+                    Tap to open
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            ) : null}
+
+            {(item.type === 'text' || !item.type || item.text || item.isDeleted) && (
               <Text
                 style={[
-                  styles.messageTime,
-                  !isMe && styles.otherMessageTime,
+                  styles.messageText,
+                  isMe ? styles.myText : styles.otherText,
+                  item.isDeleted && styles.deletedText,
                 ]}
               >
+                {item.isDeleted ? DELETED_TEXT : item.text}
+              </Text>
+            )}
+
+            <View style={styles.messageMeta}>
+              <Text style={[styles.messageTime, !isMe && styles.otherMessageTime]}>
                 {getMessageTime(item.createdAt)}
               </Text>
 
               {isMe && !item.isDeleted && (
                 <Text style={styles.statusText}>
-                  {getStatusText(item.status)}
+                  {item.status === 'seen'
+                    ? '✓✓ Seen'
+                    : item.status === 'delivered'
+                      ? '✓✓ Delivered'
+                      : '✓ Sent'}
                 </Text>
               )}
             </View>
@@ -926,7 +1130,6 @@ const ChatRoom = ({ navigation }: any) => {
     );
   };
 
-  // SCREEN UI
   return (
     <KeyboardAvoidingView
       style={styles.container}
@@ -941,7 +1144,7 @@ const ChatRoom = ({ navigation }: any) => {
           }}
           style={styles.backButton}
         >
-          <ArrowLeft size={24} color="#fff" />
+          <ArrowLeft size={24} color="#FFFFFF" />
         </TouchableOpacity>
 
         <View>
@@ -950,19 +1153,15 @@ const ChatRoom = ({ navigation }: any) => {
             style={[
               styles.online,
               {
-                color: isOtherTyping
+                color: isTyping
                   ? '#25D366'
-                  : isChatUserOnline
+                  : isOnline
                     ? '#D8FFD8'
                     : '#E0E0E0',
               },
             ]}
           >
-            {isOtherTyping
-              ? 'typing...'
-              : isChatUserOnline
-                ? 'Online'
-                : 'Offline'}
+            {isTyping ? 'Typing...' : isOnline ? 'Online' : 'Offline'}
           </Text>
         </View>
       </View>
@@ -976,8 +1175,24 @@ const ChatRoom = ({ navigation }: any) => {
         contentContainerStyle={styles.messageList}
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
-        onContentSizeChange={() =>
-          flatListRef.current?.scrollToEnd({ animated: true })
+        onContentSizeChange={() => {
+          if (messages.length > 0) {
+            flatListRef.current?.scrollToEnd({ animated: true });
+          }
+        }}
+        ListEmptyComponent={
+          <View style={styles.emptyContainer}>
+            {historyLoading ? (
+              <>
+                <ActivityIndicator color={PURPLE} />
+                <Text style={styles.emptyText}>Loading messages...</Text>
+              </>
+            ) : (
+              <Text style={styles.emptyText}>
+                No messages yet
+              </Text>
+            )}
+          </View>
         }
       />
 
@@ -989,20 +1204,18 @@ const ChatRoom = ({ navigation }: any) => {
             <Text style={styles.replyingTitle}>
               Replying to {replyingTo.sender === 'me' ? 'yourself' : name}
             </Text>
-
             <Text style={styles.replyingText} numberOfLines={2}>
               {replyingTo.isDeleted
-                ? DELETED_MESSAGE_TEXT
-                : replyingTo.text}
+                ? DELETED_TEXT
+                : replyingTo.text || replyingTo.fileName || 'Attachment'}
             </Text>
           </View>
 
           <TouchableOpacity
             onPress={() => setReplyingTo(null)}
             style={styles.cancelReplyButton}
-            accessibilityLabel="Cancel reply"
           >
-            <X size={20} color="#666" />
+            <X size={20} color="#666666" />
           </TouchableOpacity>
         </View>
       )}
@@ -1013,11 +1226,24 @@ const ChatRoom = ({ navigation }: any) => {
           { paddingBottom: Math.max(insets.bottom, 10) },
         ]}
       >
+        <TouchableOpacity
+          style={styles.attachButton}
+          onPress={() => setAttachmentMenuVisible(true)}
+          disabled={uploadingAttachment}
+          accessibilityLabel="Attach a file"
+        >
+          {uploadingAttachment ? (
+            <ActivityIndicator size="small" color={PURPLE} />
+          ) : (
+            <Paperclip size={23} color={PURPLE} />
+          )}
+        </TouchableOpacity>
+
         <TextInput
           value={message}
-          onChangeText={handleTyping}
+          onChangeText={handleTypingChange}
           placeholder="Type a message..."
-          placeholderTextColor="#999"
+          placeholderTextColor="#999999"
           style={styles.input}
           multiline
           maxLength={1000}
@@ -1028,16 +1254,66 @@ const ChatRoom = ({ navigation }: any) => {
           onPress={sendMessage}
           activeOpacity={0.8}
         >
-          <Send size={20} color="#fff" />
+          <Send size={20} color="#FFFFFF" />
         </TouchableOpacity>
       </View>
+
+      <Modal
+        transparent
+        visible={attachmentMenuVisible}
+        animationType="fade"
+        onRequestClose={() => setAttachmentMenuVisible(false)}
+      >
+        <TouchableOpacity
+          style={styles.modalBackdrop}
+          activeOpacity={1}
+          onPress={() => setAttachmentMenuVisible(false)}
+        >
+          <View
+            style={styles.attachmentMenu}
+            onStartShouldSetResponder={() => true}
+          >
+            <Text style={styles.attachmentMenuTitle}>Attach</Text>
+
+            <TouchableOpacity
+              style={styles.attachmentOption}
+              onPress={chooseGallery}
+            >
+              <ImageIcon size={22} color={PURPLE} />
+              <Text style={styles.attachmentOptionText}>Gallery</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.attachmentOption}
+              onPress={takePhoto}
+            >
+              <Camera size={22} color={PURPLE} />
+              <Text style={styles.attachmentOptionText}>Camera</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.attachmentOption}
+              onPress={chooseDocument}
+            >
+              <FileText size={22} color={PURPLE} />
+              <Text style={styles.attachmentOptionText}>Documents</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.menuCancel}
+              onPress={() => setAttachmentMenuVisible(false)}
+            >
+              <Text style={styles.menuCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </KeyboardAvoidingView>
   );
 };
 
 export default ChatRoom;
 
-// STYLES
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -1055,7 +1331,7 @@ const styles = StyleSheet.create({
     marginRight: 15,
   },
   name: {
-    color: '#fff',
+    color: '#FFFFFF',
     fontSize: 18,
     fontWeight: '700',
   },
@@ -1072,8 +1348,17 @@ const styles = StyleSheet.create({
     paddingBottom: 10,
     flexGrow: 1,
   },
-
-  // TIMELINE STYLES
+  emptyContainer: {
+    flex: 1,
+    minHeight: 160,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  emptyText: {
+    color: '#777777',
+    fontSize: 14,
+  },
   dateSeparatorContainer: {
     alignItems: 'center',
     marginTop: 12,
@@ -1090,7 +1375,6 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '700',
   },
-
   messageRow: {
     marginBottom: 10,
     flexDirection: 'row',
@@ -1102,7 +1386,7 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-start',
   },
   messageBubble: {
-    maxWidth: '75%',
+    maxWidth: '80%',
     paddingHorizontal: 15,
     paddingVertical: 10,
     borderRadius: 18,
@@ -1112,24 +1396,22 @@ const styles = StyleSheet.create({
     borderBottomRightRadius: 4,
   },
   otherBubble: {
-    backgroundColor: '#fff',
+    backgroundColor: '#FFFFFF',
     borderBottomLeftRadius: 4,
   },
   messageText: {
     fontSize: 15,
   },
   myText: {
-    color: '#fff',
+    color: '#FFFFFF',
   },
   otherText: {
-    color: '#333',
+    color: '#333333',
   },
   deletedText: {
     fontStyle: 'italic',
     opacity: 0.75,
   },
-
-  // MESSAGE TIME AND STATUS
   messageMeta: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
@@ -1143,14 +1425,12 @@ const styles = StyleSheet.create({
     color: '#D8CDEE',
   },
   otherMessageTime: {
-    color: '#888',
+    color: '#888888',
   },
   statusText: {
     color: '#E5DFFF',
     fontSize: 10,
   },
-
-  // REPLY STYLES
   replyPreviewInBubble: {
     borderLeftWidth: 3,
     borderRadius: 5,
@@ -1184,16 +1464,14 @@ const styles = StyleSheet.create({
     color: '#F5F0FF',
   },
   replyTextOther: {
-    color: '#555',
+    color: '#555555',
   },
-
-  // REPLY COMPOSER
   replyingContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#fff',
+    backgroundColor: '#FFFFFF',
     borderTopWidth: 1,
-    borderTopColor: '#eee',
+    borderTopColor: '#EEEEEE',
     paddingHorizontal: 12,
     paddingVertical: 8,
   },
@@ -1214,23 +1492,95 @@ const styles = StyleSheet.create({
     marginBottom: 2,
   },
   replyingText: {
-    color: '#666',
+    color: '#666666',
     fontSize: 12,
   },
   cancelReplyButton: {
     padding: 6,
     marginLeft: 6,
   },
-
-  // INPUT STYLES
+  attachButton: {
+    width: 38,
+    height: 45,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 4,
+  },
+  attachmentImage: {
+    width: 220,
+    height: 180,
+    borderRadius: 12,
+    marginBottom: 4,
+  },
+  fileAttachment: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    minWidth: 160,
+    paddingVertical: 6,
+    gap: 9,
+  },
+  fileAttachmentText: {
+    flex: 1,
+    maxWidth: 190,
+  },
+  fileName: {
+    color: '#333333',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  fileHint: {
+    color: '#666666',
+    fontSize: 11,
+    marginTop: 3,
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'flex-end',
+    padding: 18,
+  },
+  attachmentMenu: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    padding: 18,
+    marginBottom: 40,
+  },
+  attachmentMenuTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#222222',
+    marginBottom: 4,
+  },
+  attachmentOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 5,
+  },
+  attachmentOptionText: {
+    color: '#333333',
+    fontSize: 16,
+  },
+  menuCancel: {
+    alignItems: 'center',
+    paddingVertical: 5,
+    borderTopWidth: 1,
+    borderTopColor: '#EEEEEE',
+    marginTop: 8,
+  },
+  menuCancelText: {
+    color: PURPLE,
+    fontWeight: '700',
+    fontSize: 15,
+  },
   inputContainer: {
     flexDirection: 'row',
     alignItems: 'flex-end',
     paddingHorizontal: 10,
     paddingTop: 8,
-    backgroundColor: '#fff',
+    backgroundColor: '#FFFFFF',
     borderTopWidth: 1,
-    borderTopColor: '#eee',
+    borderTopColor: '#EEEEEE',
   },
   input: {
     flex: 1,
@@ -1241,7 +1591,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
     fontSize: 15,
-    color: '#333',
+    color: '#333333',
   },
   sendButton: {
     width: 45,

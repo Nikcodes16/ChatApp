@@ -30,14 +30,62 @@ type AppUser = {
   id: string;
   name: string;
   email: string;
+  lastMessage?: string;
+  lastMessageTime?: string;
+};
+
+type ChatMessage = {
+  roomId?: string;
+  text?: string;
+  message?: string;
+  content?: string;
+  fileName?: string;
+  createdAt?: string | number;
+  timestamp?: string | number;
+  time?: string | number;
+  [key: string]: unknown;
 };
 
 const PURPLE = '#8338EC';
 const API_URL = 'https://chatapp-6xj8.onrender.com';
 
-// Compare IDs consistently in case they contain whitespace or casing differences.
 const normalizeId = (value: unknown): string =>
-  typeof value === 'string' ? value.trim().toLowerCase() : '';
+  value == null ? '' : String(value).trim().toLowerCase();
+
+const makeRoomId = (firstId: string, secondId: string): string => {
+  const first = String(firstId ?? '').trim();
+  const second = String(secondId ?? '').trim();
+
+  return first < second
+    ? `${first}_${second}`
+    : `${second}_${first}`;
+};
+
+const getMessageTime = (message: ChatMessage): number => {
+  const value =
+    message.createdAt ?? message.timestamp ?? message.time ?? 0;
+
+  const parsed = new Date(value).getTime();
+
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const getMessagePreview = (message: ChatMessage): string => {
+  const text =
+    message.text ??
+    message.message ??
+    message.content;
+
+  if (typeof text === 'string' && text.trim()) {
+    return text.trim();
+  }
+
+  if (typeof message.fileName === 'string' && message.fileName.trim()) {
+    return `📎 ${message.fileName}`;
+  }
+
+  return 'Message';
+};
 
 const HomeScreen = ({navigation, route}: Props) => {
   const {userId} = route.params;
@@ -48,91 +96,187 @@ const HomeScreen = ({navigation, route}: Props) => {
   const [searchText, setSearchText] = useState('');
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
-
-  // UNREAD MESSAGE COUNTS
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
 
-  // Load registered users
+  // Load registered users, then keep only users with existing messages.
   const fetchUsers = useCallback(async () => {
     try {
       setLoading(true);
       setErrorMessage('');
 
-      const usersUrl = `${API_URL}/users?exclude=${encodeURIComponent(userId)}`;
-      console.log('FETCHING USERS FROM:', usersUrl);
+      const usersUrl =
+        `${API_URL}/users?exclude=${encodeURIComponent(userId)}`;
 
       const response = await fetch(usersUrl);
+      const responseText = await response.text();
 
       if (!response.ok) {
         throw new Error(`Users API error: ${response.status}`);
       }
 
-      const result: unknown = await response.json();
-      console.log('RAW USERS API RESPONSE:', result);
+      let result: unknown;
 
-      if (!Array.isArray(result)) {
-        throw new Error('Invalid users response');
+      try {
+        result = JSON.parse(responseText);
+      } catch {
+        throw new Error('Users API returned invalid JSON');
       }
 
-      const validUsers = (result as AppUser[]).filter(
-        user =>
-          user &&
-          typeof user.id === 'string' &&
-          typeof user.name === 'string' &&
-          typeof user.email === 'string' &&
-          normalizeId(user.id) !== normalizeId(userId),
+      if (!Array.isArray(result)) {
+        throw new Error('Invalid users response: expected an array');
+      }
+
+      const registeredUsers: AppUser[] = result
+        .filter((item: any) => item && typeof item === 'object')
+        .map((item: any): AppUser | null => {
+          const id = String(
+            item._id ?? item.id ?? item.userId ?? '',
+          ).trim();
+
+          if (
+            !id ||
+            typeof item.name !== 'string' ||
+            typeof item.email !== 'string'
+          ) {
+            return null;
+          }
+
+          return {
+            id,
+            name: item.name,
+            email: item.email,
+          };
+        })
+        .filter((item): item is AppUser => item !== null)
+        .filter(item => normalizeId(item.id) !== normalizeId(userId));
+
+      const conversationResults = await Promise.all(
+        registeredUsers.map(async person => {
+          const roomId = makeRoomId(userId, person.id);
+
+          const messagesUrl =
+            `${API_URL}/messages?roomId=${encodeURIComponent(roomId)}` +
+            `&userId=${encodeURIComponent(userId)}`;
+
+          try {
+            const messagesResponse = await fetch(messagesUrl);
+
+            if (!messagesResponse.ok) {
+              console.warn(
+                'Could not load messages for:',
+                person.id,
+                messagesResponse.status,
+              );
+              return null;
+            }
+
+            const messagesText = await messagesResponse.text();
+
+            let chatMessages: unknown;
+
+            try {
+              chatMessages = JSON.parse(messagesText);
+            } catch {
+              console.warn('Invalid messages response:', person.id);
+              return null;
+            }
+
+            if (!Array.isArray(chatMessages) || chatMessages.length === 0) {
+              return null;
+            }
+
+            const messages = chatMessages as ChatMessage[];
+
+            // If roomId is returned, verify it matches this conversation.
+            const roomMessages = messages.filter(message => {
+              if (!message || typeof message !== 'object') {
+                return false;
+              }
+
+              if (!message.roomId) {
+                return true;
+              }
+
+              return normalizeId(message.roomId) === normalizeId(roomId);
+            });
+
+            if (roomMessages.length === 0) {
+              return null;
+            }
+
+            const sortedMessages = [...roomMessages].sort(
+              (a, b) => getMessageTime(b) - getMessageTime(a),
+            );
+
+            const latestMessage = sortedMessages[0];
+
+            return {
+              ...person,
+              lastMessage: getMessagePreview(latestMessage),
+              lastMessageTime: String(
+                latestMessage.createdAt ??
+                  latestMessage.timestamp ??
+                  latestMessage.time ??
+                  '',
+              ),
+            } as AppUser;
+          } catch (error) {
+            console.warn(
+              'Conversation check failed for:',
+              person.id,
+              error,
+            );
+            return null;
+          }
+        }),
       );
 
-      console.log('REGISTERED USERS FROM API:', validUsers);
-      console.log(
-        'REGISTERED USER IDS:',
-        validUsers.map(user => normalizeId(user.id)),
-      );
+      const conversationUsers = conversationResults
+        .filter((person): person is AppUser => person !== null)
+        .sort(
+          (a, b) =>
+            getMessageTime({
+              timestamp: b.lastMessageTime,
+            }) -
+            getMessageTime({
+              timestamp: a.lastMessageTime,
+            }),
+        );
 
-      setUsers(validUsers);
+      setUsers(conversationUsers);
     } catch (error) {
-      console.error('FETCH USERS ERROR:', error);
-      setErrorMessage('Users not loaded. check Network .');
+      console.error('FETCH CONVERSATIONS ERROR:', error);
+      setErrorMessage(
+        'Chats not loaded. Check your network and retry.',
+      );
     } finally {
       setLoading(false);
     }
   }, [userId]);
 
-  // Load unread message counts
-  
-  // Load unread message counts
+  // Load unread message counts.
   const fetchUnreadCounts = useCallback(async () => {
-    const url = `${API_URL}/unread-counts?userId=${encodeURIComponent(userId)}`;
+    const url =
+      `${API_URL}/unread-counts?userId=${encodeURIComponent(userId)}`;
 
     try {
-      console.log('========== UNREAD API DEBUG ==========');
-      console.log('API URL:', url);
-      console.log('Current userId:', userId);
-
       const response = await fetch(url);
       const responseText = await response.text();
 
-      console.log('HTTP STATUS:', response.status);
-      console.log('RESPONSE BODY:', responseText);
-
       if (!response.ok) {
-        throw new Error(
-          `Unread API failed: HTTP ${response.status} - ${responseText}`,
-        );
+        throw new Error(`Unread API failed: HTTP ${response.status}`);
       }
 
-      let result: Record<string, number>;
+      let result: unknown;
 
       try {
         result = JSON.parse(responseText);
       } catch {
-        throw new Error(
-          `API did not return valid JSON: ${responseText}`,
-        );
+        throw new Error('Unread API returned invalid JSON');
       }
 
       if (
-        result === null ||
+        !result ||
         typeof result !== 'object' ||
         Array.isArray(result)
       ) {
@@ -141,14 +285,14 @@ const HomeScreen = ({navigation, route}: Props) => {
 
       const normalizedCounts: Record<string, number> = {};
 
-      Object.entries(result).forEach(([id, count]) => {
-        normalizedCounts[normalizeId(id)] = Math.max(
-          0,
-          Number(count) || 0,
-        );
-      });
-
-      console.log('PARSED UNREAD COUNTS:', normalizedCounts);
+      Object.entries(result as Record<string, unknown>).forEach(
+        ([id, count]) => {
+          normalizedCounts[normalizeId(id)] = Math.max(
+            0,
+            Number(count) || 0,
+          );
+        },
+      );
 
       setUnreadCounts(normalizedCounts);
     } catch (error) {
@@ -161,23 +305,21 @@ const HomeScreen = ({navigation, route}: Props) => {
     fetchUnreadCounts();
   }, [fetchUsers, fetchUnreadCounts]);
 
-  // Refresh unread counts whenever Home screen comes into focus
+  // Refresh when the Home screen becomes active.
   useEffect(() => {
     const unsubscribe = navigation.addListener('focus', () => {
+      fetchUsers();
       fetchUnreadCounts();
     });
 
     return unsubscribe;
-  }, [navigation, fetchUnreadCounts]);
+  }, [navigation, fetchUsers, fetchUnreadCounts]);
 
-  // Socket online/offline and unread-count updates
+  // Socket online/offline and unread-count updates.
   useEffect(() => {
     const handleConnect = () => {
       console.log('SOCKET CONNECTED:', socket.id);
-      console.log('EMITTING user_online:', userId);
       socket.emit('user_online', userId);
-
-      // Refresh unread counts after socket reconnects
       fetchUnreadCounts();
     };
 
@@ -199,11 +341,10 @@ const HomeScreen = ({navigation, route}: Props) => {
         new Set(
           ids
             .map(normalizeId)
-            .filter((id): id is string => id.length > 0),
+            .filter(id => id.length > 0),
         ),
       );
 
-      console.log('ONLINE USERS RECEIVED:', validIds);
       setOnlineUsers(validIds);
     };
 
@@ -217,11 +358,6 @@ const HomeScreen = ({navigation, route}: Props) => {
         return;
       }
 
-      console.log('USER STATUS RECEIVED:', {
-        userId: statusUserId,
-        online: data.online,
-      });
-
       setOnlineUsers(previous => {
         if (data.online) {
           return previous.includes(statusUserId)
@@ -233,7 +369,6 @@ const HomeScreen = ({navigation, route}: Props) => {
       });
     };
 
-    // Real-time unread count update from backend
     const handleUnreadCountUpdate = (data: {
       senderId?: string;
       count?: number;
@@ -246,18 +381,12 @@ const HomeScreen = ({navigation, route}: Props) => {
 
       const count = Math.max(0, Number(data?.count) || 0);
 
-      console.log('UNREAD COUNT UPDATE RECEIVED:', {
-        senderId,
-        count,
-      });
-
       setUnreadCounts(previous => ({
         ...previous,
         [senderId]: count,
       }));
     };
 
-    // Register listeners before emitting the user's online status.
     socket.on('connect', handleConnect);
     socket.on('disconnect', handleDisconnect);
     socket.on('connect_error', handleConnectError);
@@ -265,11 +394,9 @@ const HomeScreen = ({navigation, route}: Props) => {
     socket.on('user_status', handleUserStatus);
     socket.on('unread_count_update', handleUnreadCountUpdate);
 
-    // Ensure this screen has a live socket connection.
     if (!socket.connected) {
       socket.connect();
     } else {
-      // Handle a socket that connected before this screen mounted.
       handleConnect();
     }
 
@@ -283,7 +410,7 @@ const HomeScreen = ({navigation, route}: Props) => {
     };
   }, [userId, fetchUnreadCounts]);
 
-  // Search registered users
+  // Search within existing conversations.
   const filteredUsers = useMemo(() => {
     const query = searchText.trim().toLowerCase();
 
@@ -292,27 +419,20 @@ const HomeScreen = ({navigation, route}: Props) => {
     }
 
     return users.filter(
-      user =>
-        user.name.toLowerCase().includes(query) ||
-        user.email.toLowerCase().includes(query),
+      item =>
+        item.name.toLowerCase().includes(query) ||
+        item.email.toLowerCase().includes(query) ||
+        (item.lastMessage ?? '').toLowerCase().includes(query),
     );
   }, [users, searchText]);
 
-  // Show only registered users who are online
+  // Existing conversation partners who are online.
   const activeUsers = useMemo(() => {
     const onlineIds = new Set(onlineUsers.map(normalizeId));
 
-    const matchedUsers = filteredUsers.filter(user =>
-      onlineIds.has(normalizeId(user.id)),
+    return filteredUsers.filter(item =>
+      onlineIds.has(normalizeId(item.id)),
     );
-
-    console.log('ONLINE ID MATCH DEBUG:', {
-      registeredUserIds: filteredUsers.map(user => normalizeId(user.id)),
-      onlineIds: Array.from(onlineIds),
-      matchedUserIds: matchedUsers.map(user => normalizeId(user.id)),
-    });
-
-    return matchedUsers;
   }, [filteredUsers, onlineUsers]);
 
   const openChat = useCallback(
@@ -337,7 +457,6 @@ const HomeScreen = ({navigation, route}: Props) => {
             {item.name.charAt(0).toUpperCase() || '?'}
           </Text>
         </View>
-
         <View style={styles.onlineDot} />
       </View>
 
@@ -362,7 +481,6 @@ const HomeScreen = ({navigation, route}: Props) => {
               {item.name.charAt(0).toUpperCase() || '?'}
             </Text>
           </View>
-
           {isOnline && <View style={styles.chatOnlineDot} />}
         </View>
 
@@ -383,7 +501,7 @@ const HomeScreen = ({navigation, route}: Props) => {
 
           <View style={styles.chatBottomRow}>
             <Text style={styles.chatMessage} numberOfLines={1}>
-              {isOnline ? 'Online' : item.email}
+              {item.lastMessage || 'No messages yet'}
             </Text>
           </View>
         </View>
@@ -411,7 +529,7 @@ const HomeScreen = ({navigation, route}: Props) => {
         <Search size={20} color="#888" />
         <TextInput
           style={styles.searchInput}
-          placeholder="Search users..."
+          placeholder="Search your conversations..."
           placeholderTextColor="#999"
           value={searchText}
           onChangeText={setSearchText}
@@ -437,15 +555,15 @@ const HomeScreen = ({navigation, route}: Props) => {
           ListEmptyComponent={
             <Text style={styles.emptyActive}>
               {errorMessage
-                ? 'Could not load users.'
-                : 'No registered users online'}
+                ? 'Could not load conversations.'
+                : 'No one is online'}
             </Text>
           }
         />
       )}
 
       <View style={styles.messageHeader}>
-        <Text style={styles.sectionTitle}>Users</Text>
+        <Text style={styles.sectionTitle}>Messages</Text>
         <Text style={styles.messageCount}>{filteredUsers.length}</Text>
       </View>
 
@@ -454,10 +572,12 @@ const HomeScreen = ({navigation, route}: Props) => {
       ) : errorMessage ? (
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyText}>{errorMessage}</Text>
-
           <TouchableOpacity
             style={styles.retryButton}
-            onPress={fetchUsers}>
+            onPress={() => {
+              fetchUsers();
+              fetchUnreadCounts();
+            }}>
             <Text style={styles.retryText}>Retry</Text>
           </TouchableOpacity>
         </View>
@@ -471,57 +591,51 @@ const HomeScreen = ({navigation, route}: Props) => {
           ListEmptyComponent={
             <Text style={styles.emptyText}>
               {searchText
-                ? 'No users match your search.'
-                : 'No other registered users found.'}
+                ? 'No conversations match your search.'
+                : 'No conversations yet. Start chatting with someone to see them here.'}
             </Text>
           }
         />
       )}
 
-<View
-  style={[
-    styles.bottomBar,
-    {
-      height: 70 + insets.bottom,
-      paddingBottom: insets.bottom,
-    },
-  ]}>
-  <TouchableOpacity
-    style={styles.bottomItem}
-    onPress={() => {
-      // Home is the current screen for now
-    }}>
-    <Home size={22} color="#999" />
-    <Text style={styles.bottomText}>Home</Text>
-  </TouchableOpacity>
+      <View
+        style={[
+          styles.bottomBar,
+          {
+            height: 70 + insets.bottom,
+            paddingBottom: insets.bottom,
+          },
+        ]}>
+        <TouchableOpacity
+          style={styles.bottomItem}
+          onPress={() => navigation.navigate('Dashboard', {userId})}>
+          <Home size={22} color="#999" />
+          <Text style={styles.bottomText}>Home</Text>
+        </TouchableOpacity>
 
-  <TouchableOpacity
-    style={styles.bottomItem}
-    onPress={() => {
-      // This screen currently displays users and chat entry points
-    }}>
-    <View style={styles.activeIcon}>
-      <MessageCircle size={21} color="#fff" />
-    </View>
-    <Text style={styles.activeBottomText}>Message</Text>
-  </TouchableOpacity>
+        <TouchableOpacity style={styles.bottomItem}>
+          <View style={styles.activeIcon}>
+            <MessageCircle size={21} color="#fff" />
+          </View>
+          <Text style={styles.activeBottomText}>Message</Text>
+        </TouchableOpacity>
 
-  <TouchableOpacity
-    style={styles.bottomItem}
-    onPress={() => navigation.navigate('Calls')}>
-    <Phone size={22} color="#999" />
-    <Text style={styles.bottomText}>Calls</Text>
-  </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.bottomItem}
+          onPress={() => navigation.navigate('Calls')}>
+          <Phone size={22} color="#999" />
+          <Text style={styles.bottomText}>Calls</Text>
+        </TouchableOpacity>
 
-  <TouchableOpacity
-    style={styles.bottomItem}
-    onPress={() => navigation.navigate('Profile', {userId})}>
-    <User size={22} color="#999" />
-    <Text style={styles.bottomText}>Profile</Text>
-  </TouchableOpacity>
-</View>
-</SafeAreaView>
-);
+        <TouchableOpacity
+          style={styles.bottomItem}
+          onPress={() => navigation.navigate('Profile', {userId})}>
+          <User size={22} color="#999" />
+          <Text style={styles.bottomText}>Profile</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
+  );
 };
 
 export default HomeScreen;
@@ -665,7 +779,7 @@ const styles = StyleSheet.create({
   chatOnlineDot: {
     position: 'absolute',
     right: 0,
-    bottom: 1,
+    bottom: 0,
     width: 13,
     height: 13,
     borderRadius: 7,
@@ -689,8 +803,6 @@ const styles = StyleSheet.create({
     color: '#222',
     marginRight: 10,
   },
-
-  // NEW: unread message badge
   unreadBadge: {
     minWidth: 22,
     height: 22,
@@ -706,11 +818,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-
   chatBottomRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 5,
+    marginTop: 2,
   },
   chatMessage: {
     flex: 1,

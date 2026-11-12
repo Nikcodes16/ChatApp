@@ -32,6 +32,27 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
+    
+    isPremium: {
+      type: Boolean,
+      default: false,
+    },
+
+    premiumUntil: {
+      type: Date,
+      default: null,
+    },
+
+    premiumOrderId: {
+      type: String,
+      default: null,
+    },
+
+    premiumPaymentId: {
+      type: String,
+      default: null,
+    },
+
   },
   {
     timestamps: true,

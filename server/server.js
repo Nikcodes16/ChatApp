@@ -1,22 +1,28 @@
 const dns = require('dns');
-
 dns.setServers(['8.8.8.8', '1.1.1.1']);
 
 require('dotenv').config();
 
+const Razorpay = require('razorpay');
+
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const http = require('http');
 const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const { v2: cloudinary } = require('cloudinary');
+const { Readable } = require('stream');
 
 const Message = require('./models/Message');
 const User = require('./models/User');
 
 const app = express();
 const server = http.createServer(app);
-
+const Payment = require('./models/Payment');
 const io = new Server(server, {
   cors: {
     origin: '*',
@@ -25,6 +31,97 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(express.json());
+
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      message: 'Authentication token required',
+    });
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
+
+    req.userId = decoded.userId;
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      message: 'Invalid or expired token',
+    });
+  }
+}
+
+//razorpay
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+
+// =========================
+// CLOUDINARY CONFIGURATION
+// =========================
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// Profile-photo upload: maximum 5 MB
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024,
+    files: 1,
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+    ];
+
+    if (!allowedTypes.includes(file.mimetype)) {
+      return cb(
+        new Error('Only JPG, PNG, and WebP images are allowed.')
+      );
+    }
+
+    cb(null, true);
+  },
+});
+
+// Handle upload validation errors
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({
+      message:
+        err.code === 'LIMIT_FILE_SIZE'
+          ? 'Image must be 5 MB or smaller.'
+          : 'Invalid upload.',
+    });
+  }
+
+  if (
+    err &&
+    err.message ===
+      'Only JPG, PNG, and WebP images are allowed.'
+  ) {
+    return res.status(400).json({
+      message: err.message,
+    });
+  }
+
+  next(err);
+});
 
 // =========================
 // HEALTH CHECK
@@ -47,6 +144,183 @@ app.get('/health', (req, res) => {
 });
 
 // =========================
+// RAZORPAY: CREATE TEST ORDER
+// =========================
+
+app.post(
+  '/payments/create-order',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      if (
+        !process.env.RAZORPAY_KEY_ID ||
+        !process.env.RAZORPAY_KEY_SECRET
+      ) {
+        return res.status(500).json({
+          message: 'Razorpay keys are not configured',
+        });
+      }
+
+      const user = await User.findById(req.userId);
+
+      if (!user) {
+        return res.status(404).json({
+          message: 'User not found',
+        });
+      }
+
+      const amount = 1000; // ₹10 in paise
+
+      const order = await razorpay.orders.create({
+        amount,
+        currency: 'INR',
+        receipt: `chatapp_${Date.now()}`,
+      });
+
+      await Payment.create({
+        userId: user._id,
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        status: 'created',
+      });
+
+      return res.json({
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        keyId: process.env.RAZORPAY_KEY_ID,
+      });
+    } catch (error) {
+      console.error('Create Razorpay order error:', error);
+
+      return res.status(500).json({
+        message: 'Unable to create payment order',
+      });
+    }
+  },
+);
+
+app.post(
+  '/payments/verify',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const {
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+      } = req.body;
+
+      if (
+        !razorpay_order_id ||
+        !razorpay_payment_id ||
+        !razorpay_signature
+      ) {
+        return res.status(400).json({
+          message: 'Payment verification details are required',
+        });
+      }
+
+      const paymentRecord = await Payment.findOne({
+        orderId: razorpay_order_id,
+        userId: req.userId,
+      });
+
+      if (!paymentRecord) {
+        return res.status(404).json({
+          message: 'Payment order not found for this user',
+        });
+      }
+
+      if (paymentRecord.status === 'paid') {
+        return res.json({
+          message: 'Payment already verified',
+        });
+      }
+
+      const expectedSignature = crypto
+        .createHmac(
+          'sha256',
+          process.env.RAZORPAY_KEY_SECRET,
+        )
+        .update(
+          `${razorpay_order_id}|${razorpay_payment_id}`,
+        )
+        .digest('hex');
+
+      const expectedBuffer = Buffer.from(
+        expectedSignature,
+        'hex',
+      );
+      const receivedBuffer = Buffer.from(
+        razorpay_signature,
+        'hex',
+      );
+
+      if (
+        expectedBuffer.length !== receivedBuffer.length ||
+        !crypto.timingSafeEqual(
+          expectedBuffer,
+          receivedBuffer,
+        )
+      ) {
+        return res.status(400).json({
+          message: 'Invalid payment signature',
+        });
+      }
+
+      const razorpayPayment =
+        await razorpay.payments.fetch(razorpay_payment_id);
+
+      if (
+        razorpayPayment.order_id !== razorpay_order_id ||
+        razorpayPayment.status !== 'captured' ||
+        razorpayPayment.amount !== paymentRecord.amount ||
+        razorpayPayment.currency !== paymentRecord.currency
+      ) {
+        return res.status(400).json({
+          message: 'Payment is not captured or details do not match',
+        });
+      }
+
+      const user = await User.findById(req.userId);
+
+      if (!user) {
+        return res.status(404).json({
+          message: 'User not found',
+        });
+      }
+
+      paymentRecord.paymentId = razorpay_payment_id;
+      paymentRecord.status = 'paid';
+      await paymentRecord.save();
+
+      user.isPremium = true;
+      user.premiumOrderId = razorpay_order_id;
+      user.premiumPaymentId = razorpay_payment_id;
+      user.premiumUntil = new Date(
+        Date.now() + 30 * 24 * 60 * 60 * 1000,
+      );
+
+      await user.save();
+
+      return res.json({
+        message: 'Payment verified. Premium activated!',
+        isPremium: user.isPremium,
+        premiumUntil: user.premiumUntil,
+      });
+    } catch (error) {
+      console.error('Payment verification error:', error);
+
+      return res.status(500).json({
+        message: 'Unable to verify payment',
+      });
+    }
+  },
+);
+
+// =========================
 // GET CHAT HISTORY
 // =========================
 
@@ -61,6 +335,7 @@ app.get('/messages', async (req, res) => {
       });
     }
 
+    // First, find messages using the exact roomId.
     const messages = await Message.find({
       roomId,
       deletedFor: { $ne: userId },
@@ -68,17 +343,23 @@ app.get('/messages', async (req, res) => {
       .sort({ createdAt: 1 })
       .lean();
 
+    console.log('[GET /messages]', {
+      roomId,
+      userId,
+      count: messages.length,
+    });
+
     return res.json(messages);
   } catch (error) {
     console.error('GET /messages error:', error);
+
     return res.status(500).json({
       message: 'Failed to fetch messages',
     });
   }
 });
-
 // =========================
-// UNREAD COUNTS
+// UNREAD MESSAGE COUNTS
 // =========================
 
 app.get('/unread-counts', async (req, res) => {
@@ -91,12 +372,13 @@ app.get('/unread-counts', async (req, res) => {
       });
     }
 
-    const results = await Message.aggregate([
+    const unreadMessages = await Message.aggregate([
       {
         $match: {
           receiver: userId,
           status: { $ne: 'seen' },
           isDeleted: { $ne: true },
+          deletedFor: { $ne: userId },
         },
       },
       {
@@ -107,20 +389,18 @@ app.get('/unread-counts', async (req, res) => {
       },
     ]);
 
-    const unreadCounts = {};
+    const counts = {};
 
-    results.forEach(item => {
-      if (item._id != null) {
-        unreadCounts[String(item._id)] = item.count;
-      }
+    unreadMessages.forEach((item) => {
+      counts[item._id] = item.count;
     });
 
-    return res.json(unreadCounts);
+    res.json(counts);
   } catch (error) {
-    console.error('Unread counts fetch failed:', error);
+    console.error('Unread counts error:', error);
 
-    return res.status(500).json({
-      message: 'Failed to fetch unread counts',
+    res.status(500).json({
+      message: 'Failed to get unread counts',
     });
   }
 });
@@ -131,52 +411,36 @@ app.get('/unread-counts', async (req, res) => {
 
 app.get('/users', async (req, res) => {
   try {
-    const excludeId = req.query.exclude;
-    const filter = {};
-
-    if (
-      typeof excludeId === 'string' &&
-      mongoose.Types.ObjectId.isValid(excludeId)
-    ) {
-      filter._id = {
-        $ne: new mongoose.Types.ObjectId(excludeId),
-      };
-    }
-
-    const users = await User.find(filter)
-      .select('_id name email about profilePhoto')
-      .sort({ name: 1 })
+    const users = await User.find({})
+      .select('-password')
       .lean();
 
-    return res.json(
-      users.map(user => ({
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        about: user.about || '',
-        profilePhoto: user.profilePhoto || '',
-      })),
-    );
+    res.json(users);
   } catch (error) {
-    console.error('Users fetch failed:', error);
+    console.error('Get users error:', error);
 
-    return res.status(500).json({
+    res.status(500).json({
       message: 'Failed to fetch users',
     });
   }
 });
 
 // =========================
-// PUBLIC PROFILE HELPER
+// PUBLIC USER PROFILE
 // =========================
 
-const getPublicProfile = user => ({
-  id: user._id.toString(),
-  name: user.name,
-  email: user.email,
-  about: user.about || '',
-  profilePhoto: user.profilePhoto || '',
-});
+function getPublicProfile(user) {
+  if (!user) return null;
+
+  const data =
+    typeof user.toObject === 'function'
+      ? user.toObject()
+      : { ...user };
+
+  delete data.password;
+
+  return data;
+}
 
 // =========================
 // GET PROFILE
@@ -184,17 +448,9 @@ const getPublicProfile = user => ({
 
 app.get('/profile/:userId', async (req, res) => {
   try {
-    const { userId } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({
-        message: 'Invalid user ID',
-      });
-    }
-
-    const user = await User.findById(userId)
-      .select('_id name email about profilePhoto')
-      .lean();
+    const user = await User.findById(
+      req.params.userId
+    ).select('-password');
 
     if (!user) {
       return res.status(404).json({
@@ -202,11 +458,12 @@ app.get('/profile/:userId', async (req, res) => {
       });
     }
 
-    return res.json(getPublicProfile(user));
+    res.json(getPublicProfile(user));
   } catch (error) {
-    console.error('GET PROFILE ERROR:', error);
-    return res.status(500).json({
-      message: 'Failed to load profile',
+    console.error('Get profile error:', error);
+
+    res.status(500).json({
+      message: 'Failed to fetch profile',
     });
   }
 });
@@ -217,61 +474,32 @@ app.get('/profile/:userId', async (req, res) => {
 
 app.put('/profile/:userId', async (req, res) => {
   try {
-    const { userId } = req.params;
-    const { name, about, profilePhoto } = req.body;
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({
-        message: 'Invalid user ID',
-      });
-    }
+    const allowedFields = [
+      'name',
+      'username',
+      'bio',
+      'about',
+      'profilePhoto',
+      'avatar',
+      'phone',
+    ];
 
     const updates = {};
 
-    if (name !== undefined) {
-      if (typeof name !== 'string' || !name.trim()) {
-        return res.status(400).json({
-          message: 'Name is required',
-        });
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) {
+        updates[field] = req.body[field];
       }
-
-      updates.name = name.trim();
-    }
-
-    if (about !== undefined) {
-      if (typeof about !== 'string' || about.length > 150) {
-        return res.status(400).json({
-          message: 'About must be 150 characters or fewer',
-        });
-      }
-
-      updates.about = about.trim();
-    }
-
-    if (profilePhoto !== undefined) {
-      if (
-        typeof profilePhoto !== 'string' ||
-        profilePhoto.length > 2048
-      ) {
-        return res.status(400).json({
-          message: 'Invalid profile photo URL',
-        });
-      }
-
-      updates.profilePhoto = profilePhoto.trim();
-    }
-
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({
-        message: 'No profile fields provided',
-      });
     }
 
     const user = await User.findByIdAndUpdate(
-      userId,
+      req.params.userId,
       { $set: updates },
-      { new: true, runValidators: true },
-    ).select('_id name email about profilePhoto');
+      {
+        new: true,
+        runValidators: true,
+      }
+    ).select('-password');
 
     if (!user) {
       return res.status(404).json({
@@ -279,158 +507,372 @@ app.put('/profile/:userId', async (req, res) => {
       });
     }
 
-    return res.json({
+    res.json({
       message: 'Profile updated successfully',
       user: getPublicProfile(user),
     });
   } catch (error) {
-    console.error('UPDATE PROFILE ERROR:', error);
-    return res.status(500).json({
+    console.error('Update profile error:', error);
+
+    res.status(500).json({
       message: 'Failed to update profile',
     });
   }
 });
 
 // =========================
-// REGISTER WITH BCRYPT
+// PROFILE PHOTO UPLOAD
+// =========================
+
+app.post(
+  '/upload/profile-photo/:userId',
+  upload.single('photo'),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          message: 'Please select a photo',
+        });
+      }
+
+      if (
+        !process.env.CLOUDINARY_CLOUD_NAME ||
+        !process.env.CLOUDINARY_API_KEY ||
+        !process.env.CLOUDINARY_API_SECRET
+      ) {
+        return res.status(500).json({
+          message: 'Cloudinary is not configured',
+        });
+      }
+
+      const user = await User.findById(
+        req.params.userId
+      );
+
+      if (!user) {
+        return res.status(404).json({
+          message: 'User not found',
+        });
+      }
+
+      const uploadResult = await new Promise(
+        (resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            {
+              folder: 'chatapp/profile-photos',
+              resource_type: 'image',
+            },
+            (error, result) => {
+              if (error) return reject(error);
+              resolve(result);
+            }
+          );
+
+          Readable.from(req.file.buffer).pipe(stream);
+        }
+      );
+
+      const photoUrl = uploadResult.secure_url;
+
+      if (user.schema.path('profilePhoto')) {
+        user.profilePhoto = photoUrl;
+      } else if (user.schema.path('avatar')) {
+        user.avatar = photoUrl;
+      } else {
+        user.profilePhoto = photoUrl;
+      }
+
+      await user.save();
+
+      res.json({
+        message: 'Profile photo uploaded successfully',
+        user: getPublicProfile(user),
+      });
+    } catch (error) {
+      console.error('Profile photo upload error:', error);
+
+      res.status(500).json({
+        message: 'Failed to upload profile photo',
+      });
+    }
+  }
+);
+
+// =========================
+// REGISTER
 // =========================
 
 app.post('/register', async (req, res) => {
   try {
-    const name =
-      typeof req.body.name === 'string'
-        ? req.body.name.trim()
-        : '';
+    const { name, username, email, password } = req.body;
 
-    const email =
-      typeof req.body.email === 'string'
-        ? req.body.email.trim().toLowerCase()
-        : '';
-
-    const password =
-      typeof req.body.password === 'string'
-        ? req.body.password
-        : '';
-
-    if (!name || !email || !password) {
+    if (!name || !password || !(username || email)) {
       return res.status(400).json({
-        message: 'All fields are required',
+        message: 'Name, username/email and password are required',
       });
     }
 
-    if (password.length < 8) {
-      return res.status(400).json({
-        message: 'Password must be at least 8 characters long',
-      });
-    }
+    const normalizedEmail = email
+      ? String(email).trim().toLowerCase()
+      : '';
 
-    const existingUser = await User.findOne({ email });
+    const normalizedUsername = username
+      ? String(username).trim()
+      : '';
+
+    const existingUser = await User.findOne({
+      $or: [
+        ...(normalizedEmail
+          ? [{ email: normalizedEmail }]
+          : []),
+        ...(normalizedUsername
+          ? [{ username: normalizedUsername }]
+          : []),
+      ],
+    });
 
     if (existingUser) {
-      return res.status(400).json({
+      return res.status(409).json({
         message: 'User already exists',
       });
     }
 
-    // Store a hash, never the plain-text password.
-    const hashedPassword = await bcrypt.hash(password, 12);
+    const hashedPassword = await bcrypt.hash(
+      String(password),
+      10
+    );
 
     const user = await User.create({
-      name,
-      email,
+      name: String(name).trim(),
+      ...(normalizedUsername
+        ? { username: normalizedUsername }
+        : {}),
+      ...(normalizedEmail
+        ? { email: normalizedEmail }
+        : {}),
       password: hashedPassword,
     });
 
-    return res.status(201).json({
+    res.status(201).json({
       message: 'Registration successful',
-      userId: user._id.toString(),
-      name: user.name,
-      email: user.email,
+      user: getPublicProfile(user),
     });
   } catch (error) {
-    if (error && error.code === 11000) {
-      return res.status(400).json({
-        message: 'User already exists',
-      });
-    }
+    console.error('Register error:', error);
 
-    console.error('Registration failed:', error);
-
-    return res.status(500).json({
+    res.status(500).json({
       message: 'Registration failed',
     });
   }
 });
 
 // =========================
-// LOGIN WITH BCRYPT
-// Supports old plain-text accounts once
-// and upgrades them after successful login.
+// LOGIN
 // =========================
 
 app.post('/login', async (req, res) => {
   try {
-    const email =
-      typeof req.body.email === 'string'
-        ? req.body.email.trim().toLowerCase()
-        : '';
+    const { username, email, password } = req.body;
 
-    const password =
-      typeof req.body.password === 'string'
-        ? req.body.password
-        : '';
-
-    if (!email || !password) {
+    if ((!username && !email) || !password) {
       return res.status(400).json({
-        message: 'Email and password are required',
+        message: 'Username/email and password are required',
       });
     }
 
-    const user = await User.findOne({ email });
+    const loginValue = String(
+      username || email
+    ).trim();
 
-    if (!user || typeof user.password !== 'string') {
-      return res.status(401).json({
-        message: 'Invalid email or password',
-      });
-    }
-
-    const looksLikeBcryptHash =
-      /^\$2[aby]\$\d{2}\$/.test(user.password);
-
-    let passwordIsValid = false;
-
-    if (looksLikeBcryptHash) {
-      passwordIsValid = await bcrypt.compare(
-        password,
-        user.password,
-      );
-    } else if (user.password === password) {
-      // Migrate an old plain-text password after a valid login.
-      passwordIsValid = true;
-      user.password = await bcrypt.hash(password, 12);
-      await user.save();
-    }
-
-    if (!passwordIsValid) {
-      return res.status(401).json({
-        message: 'Invalid email or password',
-      });
-    }
-
-    return res.json({
-      message: 'Login successful',
-      userId: user._id.toString(),
-      name: user.name,
-      email: user.email,
+    const user = await User.findOne({
+      $or: [
+        { username: loginValue },
+        { email: loginValue.toLowerCase() },
+      ],
     });
-  } catch (error) {
-    console.error('Login failed:', error);
 
-    return res.status(500).json({
+    if (!user) {
+      return res.status(401).json({
+        message: 'Invalid username/email or password',
+      });
+    }
+
+    let passwordMatches = await bcrypt.compare(
+      String(password),
+      user.password
+    );
+
+    // Support migration from old plain-text passwords.
+    if (!passwordMatches && user.password === String(password)) {
+      user.password = await bcrypt.hash(
+        String(password),
+        10
+      );
+
+      await user.save();
+      passwordMatches = true;
+    }
+
+    if (!passwordMatches) {
+      return res.status(401).json({
+        message: 'Invalid username/email or password',
+      });
+    }
+
+    const token = jwt.sign(
+  { userId: user._id.toString() },
+  process.env.JWT_SECRET,
+  { expiresIn: '7d' },
+);
+
+res.json({
+  message: 'Login successful',
+  token,
+  user: getPublicProfile(user),
+});
+  } catch (error) {
+    console.error('Login error:', error);
+
+    res.status(500).json({
       message: 'Login failed',
     });
   }
 });
+// =========================
+// CHAT MEDIA UPLOAD
+// =========================
+
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 20 * 1024 * 1024, // Maximum 20 MB
+    files: 1,
+  },
+});
+
+const allowedChatMimeTypes = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+
+  'video/mp4',
+  'video/quicktime',
+
+  'application/pdf',
+  'text/plain',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/aac',
+  'audio/wav',
+  'audio/ogg',
+];
+
+app.post(
+  '/upload/chat-media/:userId',
+  (req, res, next) => {
+    chatUpload.single('file')(req, res, (error) => {
+      if (!error) {
+        return next();
+      }
+
+      return res.status(400).json({
+        message:
+          error.code === 'LIMIT_FILE_SIZE'
+            ? 'File must be 20 MB or smaller.'
+            : 'Invalid file upload.',
+      });
+    });
+  },
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+
+      if (!mongoose.Types.ObjectId.isValid(userId)) {
+        return res.status(400).json({
+          message: 'Invalid user ID',
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          message: 'Please select a file',
+        });
+      }
+
+      if (!allowedChatMimeTypes.includes(req.file.mimetype)) {
+        return res.status(415).json({
+          message: 'This file type is not supported',
+        });
+      }
+
+      if (
+        !process.env.CLOUDINARY_CLOUD_NAME ||
+        !process.env.CLOUDINARY_API_KEY ||
+        !process.env.CLOUDINARY_API_SECRET
+      ) {
+        return res.status(500).json({
+          message: 'Cloudinary is not configured',
+        });
+      }
+
+      const mimeType = req.file.mimetype;
+
+      const resourceType = mimeType.startsWith('image/')
+        ? 'image'
+        : mimeType.startsWith('video/') ||
+            mimeType.startsWith('audio/')
+          ? 'video'
+          : 'raw';
+
+      const result = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: 'chatapp/chat-media',
+            resource_type: resourceType,
+            use_filename: true,
+            unique_filename: true,
+          },
+          (error, uploadedFile) => {
+            if (error) {
+              return reject(error);
+            }
+
+            if (!uploadedFile) {
+              return reject(
+                new Error('Cloudinary returned no upload result')
+              );
+            }
+
+            resolve(uploadedFile);
+          }
+        );
+
+        Readable.from(req.file.buffer).pipe(stream);
+      });
+
+      return res.json({
+        mediaUrl: result.secure_url,
+        fileName: req.file.originalname,
+        mimeType,
+        fileSize: req.file.size,
+      });
+    } catch (error) {
+      console.error('CHAT MEDIA UPLOAD ERROR:', error);
+
+      return res.status(500).json({
+        message: 'Failed to upload chat attachment',
+      });
+    }
+  }
+);
 // =========================
 // ONLINE USERS
 // =========================
@@ -443,9 +885,7 @@ const onlineUsers = new Map();
 
 async function updateUnreadCount(receiverId, senderId) {
   try {
-    if (!receiverId || !senderId) {
-      return;
-    }
+    if (!receiverId || !senderId) return;
 
     const receiver = String(receiverId);
     const sender = String(senderId);
@@ -455,6 +895,7 @@ async function updateUnreadCount(receiverId, senderId) {
       sender,
       status: { $ne: 'seen' },
       isDeleted: { $ne: true },
+      deletedFor: { $ne: receiver },
     });
 
     const receiverSocketId = onlineUsers.get(receiver);
@@ -474,24 +915,14 @@ async function updateUnreadCount(receiverId, senderId) {
 // SOCKET CONNECTION
 // =========================
 
-io.on('connection', socket => {
+io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // =========================
-  // USER ONLINE
-  // =========================
-
-  socket.on('user_online', userId => {
-    if (!userId) {
-      return;
-    }
+  socket.on('user_online', (userId) => {
+    if (!userId) return;
 
     const id = String(userId);
-
     onlineUsers.set(id, socket.id);
-
-    console.log('USER ONLINE:', id);
-    console.log('ONLINE USERS:', Array.from(onlineUsers.keys()));
 
     io.emit('online_users', Array.from(onlineUsers.keys()));
 
@@ -501,64 +932,92 @@ io.on('connection', socket => {
     });
   });
 
-  // =========================
-  // JOIN CHAT ROOM
-  // =========================
-
-  socket.on('join_room', roomId => {
-    if (!roomId) {
-      return;
-    }
+  socket.on('join_room', (roomId) => {
+    if (!roomId) return;
 
     socket.join(String(roomId));
-
     console.log('JOINED ROOM:', String(roomId));
   });
 
-  // =========================
-  // TYPING INDICATOR
-  // =========================
+  socket.on('typing', (data) => {
+    if (!data?.roomId || !data?.userId) return;
 
-  socket.on('typing', data => {
-    if (!data?.roomId || !data?.userId) {
-      return;
-    }
-
-    const roomId = String(data.roomId);
-
-    socket.to(roomId).emit('user_typing', {
-      roomId,
+    socket.to(String(data.roomId)).emit('user_typing', {
+      roomId: String(data.roomId),
       userId: String(data.userId),
       isTyping: Boolean(data.isTyping),
     });
   });
 
   // =========================
-  // SEND MESSAGE
+  // SEND TEXT / MEDIA / LOCATION / CONTACT
   // =========================
 
-  socket.on('send_message', async message => {
+  socket.on('send_message', async (message) => {
     try {
-      console.log('MESSAGE RECEIVED:', message);
+      const senderId = String(message?.sender || '').trim();
+      const receiverId = String(message?.receiver || '').trim();
+      const roomId = String(message?.roomId || '').trim();
+      const text =
+        typeof message?.text === 'string'
+          ? message.text.trim()
+          : '';
 
-      if (
-        !message?.text?.trim() ||
-        !message?.sender ||
-        !message?.receiver ||
-        !message?.roomId
-      ) {
-        console.log('INVALID MESSAGE DATA');
+      const allowedTypes = [
+        'text',
+        'image',
+        'video',
+        'document',
+        'audio',
+        'location',
+        'contact',
+      ];
+
+      const type = allowedTypes.includes(message?.type)
+        ? message.type
+        : 'text';
+
+      const hasMedia =
+        ['image', 'video', 'document', 'audio'].includes(type) &&
+        typeof message?.mediaUrl === 'string' &&
+        message.mediaUrl.trim().length > 0;
+
+      const latitude = Number(message?.location?.latitude);
+      const longitude = Number(message?.location?.longitude);
+
+      const hasLocation =
+        type === 'location' &&
+        Number.isFinite(latitude) &&
+        Number.isFinite(longitude);
+
+      const contactName = String(
+        message?.contact?.name || ''
+      ).trim();
+
+      const hasContact =
+        type === 'contact' && contactName.length > 0;
+
+      if (!senderId || !receiverId || !roomId) {
+        console.log('Message missing sender, receiver, or roomId');
         return;
       }
 
-      const senderId = String(message.sender);
-      const receiverId = String(message.receiver);
-      const roomId = String(message.roomId);
+      if (type === 'text' && !text) return;
+      if (
+        ['image', 'video', 'document', 'audio'].includes(type) &&
+        !hasMedia
+      ) return;
+      if (type === 'location' && !hasLocation) return;
+      if (type === 'contact' && !hasContact) return;
 
       let replyTo = null;
 
-      // Validate the reply target against the same chat room.
-      if (message.replyTo?.messageId) {
+      if (
+        message.replyTo?.messageId &&
+        mongoose.Types.ObjectId.isValid(
+          String(message.replyTo.messageId)
+        )
+      ) {
         const originalMessage = await Message.findOne({
           _id: message.replyTo.messageId,
           roomId,
@@ -569,19 +1028,41 @@ io.on('connection', socket => {
             messageId: originalMessage._id.toString(),
             text: originalMessage.isDeleted
               ? 'This message was deleted'
-              : originalMessage.text,
+              : originalMessage.text ||
+                originalMessage.fileName ||
+                'Attachment',
             sender: String(originalMessage.sender),
           };
         }
       }
 
       const savedMessage = await Message.create({
-        text: message.text.trim(),
+        text,
         sender: senderId,
         receiver: receiverId,
         roomId,
         status: 'sent',
         replyTo,
+        type,
+        mediaUrl: hasMedia ? message.mediaUrl.trim() : '',
+        fileName: String(message?.fileName || ''),
+        mimeType: String(message?.mimeType || ''),
+        fileSize: Number.isFinite(Number(message?.fileSize))
+          ? Number(message.fileSize)
+          : 0,
+        location: hasLocation
+          ? {
+              latitude,
+              longitude,
+              address: String(message?.location?.address || ''),
+            }
+          : undefined,
+        contact: hasContact
+          ? {
+              name: contactName,
+              phone: String(message?.contact?.phone || ''),
+            }
+          : undefined,
         isDeleted: false,
       });
 
@@ -594,16 +1075,22 @@ io.on('connection', socket => {
         roomId,
         status: savedMessage.status,
         replyTo: savedMessage.replyTo || null,
+        type: savedMessage.type || 'text',
+        mediaUrl: savedMessage.mediaUrl || '',
+        fileName: savedMessage.fileName || '',
+        mimeType: savedMessage.mimeType || '',
+        fileSize: savedMessage.fileSize || 0,
+        location: savedMessage.location || null,
+        contact: savedMessage.contact || null,
         isDeleted: false,
+        createdAt: savedMessage.createdAt,
       };
 
-      console.log('MESSAGE SAVED:', messageData.id);
-      console.log('SAVED REPLY:', messageData.replyTo);
+      socket.emit('message_sent', {
+        ...messageData,
+        clientTempId: message?.clientTempId || null,
+      });
 
-      // Acknowledge the sender.
-      socket.emit('message_sent', messageData);
-
-      // Deliver the message to the other person in the room.
       socket.to(roomId).emit('receive_message', messageData);
 
       await updateUnreadCount(receiverId, senderId);
@@ -611,23 +1098,15 @@ io.on('connection', socket => {
       console.error('Message save failed:', error);
     }
   });
-
-  // =========================
+    // =========================
   // DELETE MESSAGE FOR EVERYONE
   // =========================
 
-  socket.on('delete_message', async data => {
+  socket.on('delete_message', async (data) => {
     try {
       const messageId = String(data?.messageId || '').trim();
       const userId = String(data?.userId || '').trim();
       const requestedRoomId = String(data?.roomId || '').trim();
-
-      console.log('DELETE REQUEST RECEIVED:', {
-        messageId,
-        userId,
-        roomId: requestedRoomId,
-        socketId: socket.id,
-      });
 
       if (
         !mongoose.Types.ObjectId.isValid(messageId) ||
@@ -639,7 +1118,6 @@ io.on('connection', socket => {
         return;
       }
 
-      // Only the original sender may delete this message.
       const message = await Message.findOne({
         _id: messageId,
         sender: userId,
@@ -647,10 +1125,6 @@ io.on('connection', socket => {
       });
 
       if (!message) {
-        console.log(
-          'DELETE FAILED: message not found, already deleted, or sender mismatch',
-        );
-
         socket.emit('delete_message_error', {
           message: 'Message not found or you cannot delete it',
         });
@@ -661,36 +1135,28 @@ io.on('connection', socket => {
         requestedRoomId &&
         String(message.roomId) !== requestedRoomId
       ) {
-        console.log('DELETE FAILED: room mismatch');
-
         socket.emit('delete_message_error', {
           message: 'Message does not belong to this chat',
         });
         return;
       }
 
-      // Soft delete: keep the record so chat history stays consistent.
       message.text = 'This message was deleted';
       message.isDeleted = true;
       message.deletedBy = userId;
 
       await message.save();
 
-      const payload = {
+      io.to(String(message.roomId)).emit('message_deleted', {
         messageId: message._id.toString(),
         roomId: String(message.roomId),
         text: 'This message was deleted',
         isDeleted: true,
-      };
-
-      console.log('DELETE SUCCESS:', payload);
-
-      // Send the update to both users in the chat room.
-      io.to(String(message.roomId)).emit('message_deleted', payload);
+      });
 
       await updateUnreadCount(
         String(message.receiver),
-        String(message.sender),
+        String(message.sender)
       );
     } catch (error) {
       console.error('DELETE MESSAGE ERROR:', error);
@@ -705,7 +1171,7 @@ io.on('connection', socket => {
   // DELETE MESSAGE FOR ME
   // =========================
 
-  socket.on('delete_message_for_me', async data => {
+  socket.on('delete_message_for_me', async (data) => {
     try {
       const messageId = String(data?.messageId || '').trim();
       const userId = String(data?.userId || '').trim();
@@ -725,7 +1191,10 @@ io.on('connection', socket => {
       const message = await Message.findOne({
         _id: messageId,
         roomId,
-        $or: [{ sender: userId }, { receiver: userId }],
+        $or: [
+          { sender: userId },
+          { receiver: userId },
+        ],
       });
 
       if (!message) {
@@ -735,13 +1204,11 @@ io.on('connection', socket => {
         return;
       }
 
-      // Avoid adding the same user more than once.
       if (!message.deletedFor.includes(userId)) {
         message.deletedFor.push(userId);
         await message.save();
       }
 
-      // Notify only the requesting socket.
       socket.emit('message_deleted_for_me', {
         messageId: message._id.toString(),
         roomId: String(message.roomId),
@@ -760,7 +1227,7 @@ io.on('connection', socket => {
   // MESSAGE DELIVERED
   // =========================
 
-  socket.on('message_delivered', async messageId => {
+  socket.on('message_delivered', async (messageId) => {
     try {
       if (
         !messageId ||
@@ -781,7 +1248,7 @@ io.on('connection', socket => {
       }
 
       const senderSocketId = onlineUsers.get(
-        String(updatedMessage.sender),
+        String(updatedMessage.sender)
       );
 
       if (senderSocketId) {
@@ -799,7 +1266,7 @@ io.on('connection', socket => {
   // MESSAGE SEEN
   // =========================
 
-  socket.on('message_seen', async messageId => {
+  socket.on('message_seen', async (messageId) => {
     try {
       if (
         !messageId ||
@@ -819,7 +1286,6 @@ io.on('connection', socket => {
 
       const senderId = String(updatedMessage.sender);
       const receiverId = String(updatedMessage.receiver);
-
       const senderSocketId = onlineUsers.get(senderId);
 
       if (senderSocketId) {
@@ -851,15 +1317,19 @@ io.on('connection', socket => {
           online: false,
         });
 
-        io.emit('online_users', Array.from(onlineUsers.keys()));
+        io.emit(
+          'online_users',
+          Array.from(onlineUsers.keys())
+        );
 
         break;
       }
     }
   });
 });
+
 // =========================
-// CONNECT MONGODB + START SERVER
+// CONNECT MONGODB + START
 // =========================
 
 const PORT = process.env.PORT || 5000;
@@ -879,7 +1349,7 @@ mongoose
       console.log(`Health check: http://localhost:${PORT}/health`);
     });
   })
-  .catch(error => {
+  .catch((error) => {
     console.error('MongoDB connection failed:', error);
     process.exit(1);
   });
